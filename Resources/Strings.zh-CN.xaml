@@ -1,0 +1,33 @@
+<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+
+    <sys:String x:Key="MainTab">视频</sys:String>
+    <sys:String x:Key="LogTab">日志</sys:String>
+    <sys:String x:Key="InputVideo">视频输入</sys:String>
+    <sys:String x:Key="OutputVideo">视频输出</sys:String>
+    <sys:String x:Key="Browse">浏览</sys:String>
+    <sys:String x:Key="EncodingStandard">编码方法</sys:String>
+    <sys:String x:Key="Resolution">分辨率</sys:String>
+    <sys:String x:Key="Width">宽度</sys:String>
+    <sys:String x:Key="Height">高度</sys:String>
+    <sys:String x:Key="ScaleUp">允许强制放大</sys:String>
+    <sys:String x:Key="ExtractAudio">分离音频流</sys:String>
+    <sys:String x:Key="Start">开始</sys:String>
+    <sys:String x:Key="Stop">停止</sys:String>
+    <sys:String x:Key="SaveLog">保存日志</sys:String>
+    <sys:String x:Key="Help">帮助</sys:String>
+    <sys:String x:Key="AutoScroll">自动滚动</sys:String>
+    <sys:String x:Key="Exit">退出</sys:String>
+    <sys:String x:Key="FfmpegNotFound">未找到 FFmpeg</sys:String>
+    <sys:String x:Key="FfmpegNotFoundMessage">FFmpeg 工具未找到！&#x0a;&#x0a;请将以下文件放入 tools 文件夹：&#x0a;• ffmpeg.exe&#x0a;• ffprobe.exe&#x0a;&#x0a;tools 文件夹位置：{0}</sys:String>
+    <sys:String x:Key="DownloadFfmpeg">下载 FFmpeg</sys:String>
+    <sys:String x:Key="About">关于</sys:String>
+    <sys:String x:Key="AboutDescription">osu! 视频压制工具
+使用 x264 编码器为 osu! 制作兼容的背景视频。</sys:String>
+    <sys:String x:Key="AboutVersion">版本 {0}</sys:String>
+    <sys:String x:Key="ProjectRepository">项目仓库</sys:String>
+    <sys:String x:Key="UserManual">使用说明</sys:String>
+    <sys:String x:Key="Close">关闭</sys:String>
+</ResourceDictionary>

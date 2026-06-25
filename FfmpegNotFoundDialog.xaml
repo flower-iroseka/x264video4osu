@@ -1,0 +1,40 @@
+<Window x:Class="x264video4osu.FfmpegNotFoundDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="{DynamicResource FfmpegNotFound}"
+        Width="420"
+        Height="200"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen"
+        ShowInTaskbar="False">
+
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock x:Name="MessageText"
+                   Grid.Row="0"
+                   TextWrapping="Wrap"
+                   VerticalAlignment="Center"
+                   TextAlignment="Left"/>
+
+        <StackPanel Grid.Row="1"
+                    Orientation="Horizontal"
+                    HorizontalAlignment="Right"
+                    Margin="0,20,0,0">
+            <Button x:Name="DownloadButton"
+                    Content="{DynamicResource DownloadFfmpeg}"
+                    Width="120"
+                    Height="32"
+                    Margin="0,0,12,0"
+                    Click="Download_Click"/>
+            <Button x:Name="ExitButton"
+                    Content="{DynamicResource Exit}"
+                    Width="120"
+                    Height="32"
+                    Click="Exit_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>
