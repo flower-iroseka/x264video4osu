@@ -35,7 +35,9 @@
 - `ffmpeg.exe`
 - `ffprobe.exe`
 
-可以从 [FFmpeg 官网](https://ffmpeg.org/download.html) 下载，或使用 [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 的构建版本。
+**注意**：Release 版本已包含这些文件，仅在从源码编译时才需要单独下载 FFmpeg。
+
+从 [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 下载（包含 x264 的 GPL 版本）。
 
 ### 使用步骤
 
@@ -229,4 +231,4 @@ dotnet build
 
 本项目采用 MIT License 发布。
 
-本项目附带的 FFmpeg 程序（ffmpeg.exe、ffprobe.exe）来自 [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases)，采用 **LGPL v3** 许可证发布。
+本项目附带的 FFmpeg 程序（ffmpeg.exe、ffprobe.exe）来自 [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)，采用 **GPL v3** 许可证发布。

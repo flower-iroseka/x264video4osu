@@ -35,7 +35,9 @@ The following files are required in the `tools` folder:
 - `ffmpeg.exe`
 - `ffprobe.exe`
 
-Download from [FFmpeg official website](https://ffmpeg.org/download.html) or use builds from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/).
+**Note**: The release version already includes these files. You only need to download FFmpeg separately if you're building from source.
+
+Download from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (GPL builds with x264 included).
 
 ### Usage
 
@@ -229,4 +231,4 @@ dotnet build
 
 This project is released under the MIT License.
 
-The included FFmpeg programs (ffmpeg.exe, ffprobe.exe) are from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases), released under the **LGPL v3** license.
+The included FFmpeg programs (ffmpeg.exe, ffprobe.exe) are from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/), released under the **GPL v3** license.
