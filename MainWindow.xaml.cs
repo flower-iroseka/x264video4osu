@@ -15,6 +15,21 @@ public partial class MainWindow : Window
     private string? _lastOutputPath;
     private string? _currentLogFileName;
 
+    /// <summary>
+    /// 当前选中的输出格式
+    /// </summary>
+    private OutputFormat SelectedFormat
+    {
+        get
+        {
+            if (FormatBox.SelectedItem is System.Windows.Controls.ComboBoxItem item &&
+                item.Tag is string tag &&
+                Enum.TryParse<OutputFormat>(tag, true, out var format))
+                return format;
+            return OutputFormat.Flv;
+        }
+    }
+
     public MainWindow()
     {
         InitializeComponent();
@@ -169,6 +184,7 @@ public partial class MainWindow : Window
         }
 
         AppendLog($"[CONFIG] Encoding mode: {(mode == EncodeMode.TwoPass ? "2-Pass (VBR)" : "CRF (Constant Rate Factor)")}");
+        AppendLog($"[CONFIG] Output format: {SelectedFormat.ToString().ToLowerInvariant()}");
 
         if (mode == EncodeMode.TwoPass)
         {
@@ -216,9 +232,11 @@ public partial class MainWindow : Window
 
     private void BrowseOutput_Click(object sender, RoutedEventArgs e)
     {
+        string ext = SelectedFormat.Extension().TrimStart('.');
         var dlg = new SaveFileDialog
         {
-            Filter = "MP4 Video|*.mp4"
+            Filter = $"Video Files|*.mp4;*.flv;*.avi",
+            DefaultExt = ext
         };
         if (dlg.ShowDialog() == true)
             OutputPathBox.Text = dlg.FileName;
@@ -304,6 +322,9 @@ private (string pass1, string pass2, string output, string logFileName, string? 
     string input = InputPathBox.Text.Trim();
     string output = OutputPathBox.Text.Trim();
 
+    // 当前选中的输出格式
+    OutputFormat format = SelectedFormat;
+
     // 验证并规范化输入路径
     if (string.IsNullOrWhiteSpace(input))
         throw new ArgumentException("Input path cannot be empty.");
@@ -318,7 +339,7 @@ private (string pass1, string pass2, string output, string logFileName, string? 
     {
         var dir = Path.GetDirectoryName(input) ?? "";
         var name = Path.GetFileNameWithoutExtension(input);
-        output = Path.Combine(dir, $"{name}_output.mp4");
+        output = Path.Combine(dir, $"{name}_output{format.Extension()}");
     }
     else
     {
@@ -329,6 +350,9 @@ private (string pass1, string pass2, string output, string logFileName, string? 
 
         output = Path.GetFullPath(output);
     }
+
+    // 确保输出扩展名与所选格式一致
+    output = Path.ChangeExtension(output, format.Extension());
 
     // 日志文件名（仅在2pass时需要）- 使用 GUID 避免冲突
     string logFileName = $"log_{Guid.NewGuid():N}";
@@ -376,6 +400,9 @@ private (string pass1, string pass2, string output, string logFileName, string? 
         "-pix_fmt yuv420p " +
         "-an ";
 
+    // 各格式特有的容器参数（例如 mp4 需要 +faststart 以便渐进式播放）
+    string containerArgs = format.ContainerArgs();
+
     string pass1, pass2;
 
     if (isTwoPass)
@@ -386,16 +413,18 @@ private (string pass1, string pass2, string output, string logFileName, string? 
             $"-maxrate {maxrate} " +
             $"-bufsize {bufsize} ";
 
+        // pass1 输出到 NUL，muxer 需与所选格式对应
         pass1 =
             $"{twoPassCommon} " +
             "-pass 1 " +
             $"-passlogfile {EscapePathArgument(logFileName)} " +
-            "-f mp4 NUL";
+            $"-f {format.Pass1Muxer()} NUL";
 
         pass2 =
             $"{twoPassCommon} " +
             "-pass 2 " +
             $"-passlogfile {EscapePathArgument(logFileName)} " +
+            containerArgs +
             $"{EscapePathArgument(output)}";
     }
     else
@@ -409,8 +438,8 @@ private (string pass1, string pass2, string output, string logFileName, string? 
 
         // CRF模式下，pass1 为空（不执行），pass2 为实际编码命令
         pass1 = "";
-        pass2 = $"{crfArgs}{EscapePathArgument(output)}";
-        
+        pass2 = $"{crfArgs}{containerArgs}{EscapePathArgument(output)}";
+
         // CRF模式不需要日志文件
         logFileName = "";
     }

@@ -9,6 +9,8 @@
     <sys:String x:Key="OutputVideo">视频输出</sys:String>
     <sys:String x:Key="Browse">浏览</sys:String>
     <sys:String x:Key="EncodingStandard">编码方法</sys:String>
+    <sys:String x:Key="OutputFormat">输出格式</sys:String>
+    <sys:String x:Key="FormatTip">osu stable版本存在既有bug，mp4格式的视频会导致游戏随机崩溃，建议使用flv或者avi格式</sys:String>
     <sys:String x:Key="Resolution">分辨率</sys:String>
     <sys:String x:Key="Width">宽度</sys:String>
     <sys:String x:Key="Height">高度</sys:String>

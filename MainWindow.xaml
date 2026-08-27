@@ -2,8 +2,8 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="x264video4osu"
-        Width="500"
-        Height="400"
+        Width="520"
+        Height="420"
         MinWidth="480"
         MinHeight="380"
         AllowDrop="True"
@@ -77,6 +77,43 @@
                             <!-- Args Settings -->
                             <StackPanel Margin="0,0,0,8">
 
+                                <!-- Output Format -->
+                                <StackPanel Orientation="Horizontal"
+                                        Margin="0,0,0,6">
+                                    <Label Content="{DynamicResource OutputFormat}"
+                                           Width="90"
+                                            VerticalAlignment="Center"/>
+                                    <ComboBox x:Name="FormatBox"
+                                             Width="80"
+                                             SelectedIndex="0"
+                                             VerticalContentAlignment="Center">
+                                        <ComboBoxItem Content="flv" Tag="Flv"/>
+                                        <ComboBoxItem Content="avi" Tag="Avi"/>
+                                        <ComboBoxItem Content="mp4" Tag="Mp4"/>
+                                    </ComboBox>
+                                    <!-- 带圈小 i 提示图标 -->
+                                    <Grid Width="16"
+                                          Height="16"
+                                          Margin="6,0,0,0"
+                                          Cursor="Help"
+                                          ToolTipService.ToolTip="{DynamicResource FormatTip}"
+                                          ToolTipService.InitialShowDelay="0"
+                                          ToolTipService.BetweenShowDelay="0"
+                                          ToolTipService.Placement="Top"
+                                          ToolTipService.VerticalOffset="-4">
+                                        <Ellipse Stroke="#7F7F7F"
+                                                 StrokeThickness="1.2"
+                                                 Fill="#CFCFCF"/>
+                                        <TextBlock Text="i"
+                                                   FontFamily="Segoe UI"
+                                                   FontSize="11"
+                                                   FontWeight="Bold"
+                                                   Foreground="#5A5A5A"
+                                                   HorizontalAlignment="Center"
+                                                   VerticalAlignment="Center"/>
+                                    </Grid>
+                                </StackPanel>
+
                                 <!-- Encoding Mode Selection: 2pass / CRF -->
                                 <StackPanel Orientation="Horizontal"
                                         Margin="0,0,0,6">
@@ -84,15 +121,15 @@
                                            Width="90"
                                             VerticalAlignment="Center"/>
                                     <StackPanel Orientation="Horizontal">
-                                        <RadioButton x:Name="TwoPassRadio"
-                                                Content="2pass"
+                                        <RadioButton x:Name="CrfRadio"
+                                                Content="CRF"
                                                 IsChecked="True"
                                                 Margin="0,0,6,0"
                                                 VerticalAlignment="Center"
                                                 GroupName="EncodeMode"
                                                 Checked="EncodeMode_Changed"/>
-                                        <RadioButton x:Name="CrfRadio"
-                                                Content="CRF"
+                                        <RadioButton x:Name="TwoPassRadio"
+                                                Content="2pass"
                                                 Margin="0,0,6,0"
                                                 VerticalAlignment="Center"
                                                 GroupName="EncodeMode"
@@ -108,7 +145,7 @@
                                             VerticalAlignment="Center"/>
                                     <TextBox x:Name="BitrateBox"
                                              Width="80"
-                                             Text="800"
+                                             Text="26"
                                              VerticalContentAlignment="Center"
                                              Margin="6,0,0,0"/>
                                 </StackPanel>

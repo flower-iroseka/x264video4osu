@@ -35,4 +35,9 @@ public class EncodeOptions
     /// CRF值（仅CRF模式使用）
     /// </summary>
     public int CrfValue { get; set; } = 23;
+
+    /// <summary>
+    /// 输出封装格式
+    /// </summary>
+    public OutputFormat Format { get; set; } = OutputFormat.Flv;
 }

@@ -9,6 +9,8 @@
     <sys:String x:Key="OutputVideo">Video Output</sys:String>
     <sys:String x:Key="Browse">Browse</sys:String>
     <sys:String x:Key="EncodingStandard">Method</sys:String>
+    <sys:String x:Key="OutputFormat">Format</sys:String>
+    <sys:String x:Key="FormatTip">osu! stable has a known bug where mp4 videos cause random game crashes. We recommend using flv or avi format.</sys:String>
     <sys:String x:Key="Resolution">Resolution</sys:String>
     <sys:String x:Key="Width">Width</sys:String>
     <sys:String x:Key="Height">Height</sys:String>
