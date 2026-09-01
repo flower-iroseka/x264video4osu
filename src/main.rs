@@ -15,6 +15,7 @@ mod platform;
 mod services;
 #[cfg(test)]
 mod log_layout_test;
+mod res_row_layout_test;
 
 include!(concat!(env!("OUT_DIR"), "/main.rs"));
 include!(concat!(env!("OUT_DIR"), "/about.rs"));

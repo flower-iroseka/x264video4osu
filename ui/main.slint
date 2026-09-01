@@ -292,14 +292,27 @@ export component MainWindow inherits Window {
                         }
 
                         // ---- 分辨率 ----
+                        // LineEdit 默认 horizontal-stretch:1 / min-width:160px，放进行内会拉满整行、
+                        // 把 caption 撑开。这里固定输入框宽度（70px，可容纳 5 位数）并禁止拉伸。
+                        // 「宽度」标签与上面输入框的起始列对齐（紧跟 90px 标签列），输入框紧贴其后；
+                        // 剩余横向空间按 45%:55% 分割，在约 45% 处放入「高度」+ 高度输入框。
                         HorizontalBox {
                             vertical-stretch: 0;
+                            // 与上面各行的 spacing:4px 一致，保证「宽度」跟输入框的起始列对齐
                             spacing: 4px;
                             Text { text: strings.label-resolution; width: 90px; vertical-alignment: center; }
-                            Text { text: strings.label-width; vertical-alignment: center; }
-                            LineEdit { width: 60px; text <=> root.width-text; }
-                            Text { text: strings.label-height; vertical-alignment: center; }
-                            LineEdit { width: 60px; text <=> root.height-text; }
+                            HorizontalLayout {
+                                spacing: 3px;
+                                Text { text: strings.label-width; vertical-alignment: center; }
+                                LineEdit { min-width: 70px; horizontal-stretch: 0; text <=> root.width-text; }
+                            }
+                            Rectangle { horizontal-stretch: 45; }
+                            HorizontalLayout {
+                                spacing: 3px;
+                                Text { text: strings.label-height; vertical-alignment: center; }
+                                LineEdit { min-width: 70px; horizontal-stretch: 0; text <=> root.height-text; }
+                            }
+                            Rectangle { horizontal-stretch: 55; }
                         }
 
                         // ---- 复选项（左侧 10px 空白 margin） ----
