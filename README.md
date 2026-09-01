@@ -97,10 +97,10 @@ The program offers two main encoding modes. **CRF is the recommended default** f
 | **Default value** | 800 kbps |
 | **Output size** | Precisely controlled (bitrate × duration ≈ file size) |
 | **Encoding speed** | Slower (requires two passes) |
-| **Use case** | Set-and-forget: a strict size budget, no desire to iterate on CRF |
+| **Use case** | Strict size budget; prefer not to iterate on CRF |
 
 **Advantages**:
-- ✅ Predictable and precisely controlled file size — set the bitrate, click start, walk away
+- ✅ Predictable and precisely controlled file size — set the bitrate and start encoding
 - ✅ Allocates more bits to complex scenes, saves bits on simple scenes
 
 **Disadvantages**:
@@ -127,12 +127,12 @@ For typical osu! background videos (usually anime OPs, under 2 minutes, < 15MB r
 |-----------|-------------------|-------------|
 | Encoding mode | **CRF** (default) | Animation compresses well; iterate the CRF value to hit your size |
 | CRF | **26-28** | Start at 26, then adjust by 1-2 to tune the output size |
-| Resolution | **720p or original** | Keep vertical aspect ratio |
+| Resolution | **720p or original** | Keep the original aspect ratio; osu! requires video dimensions no larger than 1280×720 |
 | FPS | **24** | Frame rate setting |
 
 **Quick workflow**: encode once at CRF 26. If the file is too large, raise CRF by 1-2 and re-encode; if you have room to spare, lower it for better quality. Because anime OPs compress so efficiently, you'll usually settle on a satisfying size after one or two tries.
 
-**Prefer set-and-forget?** If you must fit a fixed budget exactly — e.g. a beatmap with a strict file-size limit — skip the iteration and use **2-Pass** with an estimated bitrate. It costs roughly twice the encode time, but the output size lands predictably on the first try.
+If you must fit a fixed budget exactly (e.g. a beatmap with a strict file-size limit), use **2-Pass** with an estimated bitrate. It costs roughly twice the encode time, but the output size is predictable.
 
 **Bitrate selection guide** (for 2-Pass):
 
@@ -148,26 +148,30 @@ For typical osu! background videos (usually anime OPs, under 2 minutes, < 15MB r
    - Click "Browse" button to select file
    - Or drag and drop video file onto the window
 
-2. **Set output path** (optional)
-   - If not set, automatically generates `{original_name}_output.mp4` in the same directory
+2. **Select output format**
+   - Use **flv** or **avi**. osu! stable has a known bug where mp4 background videos cause random game crashes ([forum thread](https://osu.ppy.sh/community/forums/topics/1976015?n=1)), so mp4 is not recommended.
 
-3. **Configure encoding parameters**
+3. **Set output path** (optional)
+   - If not set, automatically generates `{original_name}_output.flv` in the same directory
+
+4. **Configure encoding parameters**
 
    | Parameter | Description |
    |-----------|-------------|
+   | **Output format** | flv / avi / mp4 |
    | **Encoding Standard** | Select 2pass or CRF mode |
    | **Value box** | 2pass = bitrate, CRF = quality value |
    | **Resolution** | Width × Height, set to 0 to keep original |
    | **Scale Up** | Allow upscaling (disabled by default) |
    | **Extract Audio** | Extract audio track separately as .m4a file |
 
-4. **Click "Start"** to begin encoding
+5. **Click "Start"** to begin encoding
 
-5. **View progress**
+6. **View progress**
    - Main interface shows real-time progress
    - "Log" tab shows detailed logs
 
-6. **Completion**
+7. **Completion**
    - Displays output file size
    - Click "Open Output Folder" to open output directory
 
