@@ -1,0 +1,33 @@
+import { Button, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+export component MessageDialog inherits Window {
+    title: root.dialog-title;
+    width: 380px;
+    height: 170px;
+    background: #F9FAFB;
+
+    in property <string> dialog-title;
+    in property <string> message;
+    in property <string> ok-text;
+
+    callback ok();
+
+    VerticalBox {
+        padding: 20px;
+        spacing: 16px;
+
+        Text {
+            text: root.message;
+            wrap: word-wrap;
+        }
+        Rectangle { height: 0px; vertical-stretch: 1; }
+        HorizontalBox {
+            alignment: center;
+            Button {
+                text: root.ok-text;
+                width: 100px;
+                clicked => { root.ok(); }
+            }
+        }
+    }
+}

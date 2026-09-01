@@ -1,9 +1,10 @@
 {
-  "omnisharp.useModernNet": true,
-  "omnisharp.enableRoslynAnalyzers": true,
-  "omnisharp.projectLoadProperties": {
-    "UseWpf": true,
-    "UseWindowsForms": false
+  "rust-analyzer.checkOnSave": true,
+  "rust-analyzer.check.command": "clippy",
+  "[rust]": {
+    "editor.formatOnSave": true
   },
-  "Codegeex.RepoIndex": true
+  "files.exclude": {
+    "**/target": true
+  }
 }

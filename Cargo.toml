@@ -1,0 +1,49 @@
+[package]
+name = "x264video4osu"
+version = "1.0.0"
+edition = "2021"
+description = "Rust + Slint port of x264video4osu (osu! background video compressor)"
+license = "MIT"
+
+# Windows-only desktop app. The GUI is not headless-testable on other platforms.
+[[bin]]
+name = "x264video4osu"
+path = "src/main.rs"
+
+[dependencies]
+slint = { version = "1.17.1", features = ["unstable-winit-030"] }
+rfd = "0.17.2"
+regex = "1.11"
+uuid = { version = "1.16", features = ["v4"] }
+open = "5.4.2"
+# 仅用 GetLocalTime 生成时间戳（旧程序使用 DateTime.Now 格式化）
+# windows-sys 0.61 中 GetLocalTime 位于 Win32_System_SystemInformation，
+# SYSTEMTIME 位于 Win32_Foundation（随该 feature 一并启用）
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+
+[dev-dependencies]
+i-slint-backend-testing = "1.17.1"
+
+# 本地 patch：修复 femtovg 渲染器在非整数 DPI（如 125%）下把 device pixel ratio
+# 传成 ceil(scale_factor)=2.0，导致 AA 羽化(fringe=1.0/dpi)只有 0.5px、小控件
+# （单选钮/复选框）边缘锯齿的问题。Slint 以物理像素绘制，改为传 1.0 使 fringe
+# 正好 1 设备像素。改动见 third_party/i-slint-renderer-femtovg/lib.rs。
+[patch.crates-io]
+i-slint-renderer-femtovg = { path = "third_party/i-slint-renderer-femtovg" }
+
+[build-dependencies]
+# 自定义 build.rs 直接驱动 i-slint-compiler：开启 enable_experimental，
+# 使文件系统加载的自定义风格（third_party/fluent-lite）能访问内部类型
+# （TabWidget / SlintInternal）与 experimental interface（uses/implements）特性。
+# slint-build 不暴露 enable_experimental，故不依赖它。
+i-slint-compiler = { version = "=1.17.1", features = ["default", "rust", "display-diagnostics", "software-renderer", "bundle-translations"] }
+spin_on = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,383 @@
+import { Button, LineEdit, ComboBox, CheckBox, TabWidget, RadioGroup, ListView, HorizontalBox, VerticalBox } from "std-widgets.slint";
+
+// 全部 UI 文本（随语言切换由 Rust 端一次性更新）
+export struct UiStrings {
+    tab-video: string,
+    tab-log: string,
+    label-input: string,
+    label-output: string,
+    button-browse: string,
+    label-format: string,
+    format-tip: string,
+    label-method: string,
+    label-resolution: string,
+    label-width: string,
+    label-height: string,
+    check-scale-up: string,
+    check-extract-audio: string,
+    button-start: string,
+    button-stop: string,
+    check-auto-scroll: string,
+    button-save-log: string,
+    button-about: string,
+    button-open-folder: string,
+}
+
+// 日志面板。滚动由 Rust 端驱动：启用自动滚动时在追加日志后把
+// viewport-y 设为内容底部；关闭后不干预，用户可自由滚动。
+// 用 ListView 逐行渲染，而不是「ScrollView + 单个 Text」：Slint 1.17 里
+// ScrollView 内元素的宽度一旦绑定到视口宽度就形成绑定环，内容被钳制到
+// 可视区、永远不溢出 → 没有滚动条，滚动与自动滚动全部失效。
+// ListView 每行独立布局（占满全宽、自动换行），视口高度随行数正确增长。
+component LogView inherits VerticalBox {
+    in property <[string]> log-lines;
+    in property <bool> auto-scroll: true;
+
+    in-out property <length> viewport-y <=> i-scroll-view.viewport-y;
+    out property <length> viewport-height <=> i-scroll-view.viewport-height;
+    out property <length> visible-height <=> i-scroll-view.visible-height;
+
+    // 由 Rust 端在追加日志且启用自动滚动时调用（滚动到底部）
+    callback scroll-to-end();
+
+    i-scroll-view := ListView {
+        horizontal-stretch: 1;
+        vertical-stretch: 1;
+        for line in root.log-lines: Text {
+            text: line;
+            wrap: word-wrap;
+            font-family: "Consolas";
+            font-size: 11px;
+        }
+    }
+
+    scroll-to-end => {
+        // Flickable 的 viewport-y 向下为负（运行时取 -viewport-y 作为滚动偏移），
+        // 所以到底部要写负值；写成正值会被钳制回顶部，导致“自动滚动”无效。
+        i-scroll-view.viewport-y = -(i-scroll-view.viewport-height - i-scroll-view.visible-height);
+    }
+}
+
+// 自定义进度条：轨道与填充同高（12px，对齐 WPF <ProgressBar Height="12">）。
+// std-widgets 的 ProgressIndicator 内部轨道硬编码 1px，加粗后轨道与填充高度不匹配，
+// 故自定义为全高轨道框 + 同高填充，颜色沿用 FluentPalette 保持一致。
+component ThickProgressBar {
+    in property <float> progress;
+
+    height: 12px;
+    horizontal-stretch: 1;
+
+    Rectangle {
+        // 轨道（背景框）：纯白底，外圈 1px 极淡灰细边框（与文本框边框同风格，
+        // fluent LineEdit 边框即 1px #0000000F，叠白底 ≈ #F0F0F0）。
+        background: #FFFFFF;
+        border-radius: 3px;
+        border-width: 1px;
+        border-color: #F0F0F0;
+        clip: true;
+
+        // 填充：宽度随进度变化，向内缩 1px 避开黑色边框（高度同减），
+        // 颜色用 Windows/VS Code 默认蓝 #0078D4。
+        Rectangle {
+            x: 1px;
+            y: 1px;
+            width: (parent.width - 2px) * min(1.0, max(0.0, root.progress));
+            height: parent.height - 2px;
+            background: #0078D4;
+        }
+    }
+}
+
+// 带圈 i 提示按钮：悬停时圈和文字轻微亮起；点击才弹出 osu! 格式建议气泡。
+// 对应旧程序 MainWindow.xaml 中 FormatBox 右侧的提示句柄
+// （Grid + Ellipse + "i"，ToolTipService.InitialShowDelay=0）。
+// 气泡位置按点击点计算并右下方偏移 16px，避开鼠标指针；
+// 任意位置点击（close-on-click）或 15 秒后自动隐藏。
+component FormatTip inherits Rectangle {
+    in property <string> tip-text;
+
+    width: 16px;
+    height: 16px;
+
+    // 圈 + i 图标（悬停或气泡打开时轻微亮起：填充变亮、边框与文字泛蓝）
+    Rectangle {
+        border-radius: 8px;
+        border-width: 1.2px;
+        border-color: touch.has-hover || tip.is-open ? #0078D4 : #7F7F7F;
+        background: touch.has-hover || tip.is-open ? #E3F2FD : #CFCFCF;
+        Text {
+            text: "i";
+            font-weight: 700;
+            font-size: 11px;
+            color: touch.has-hover || tip.is-open ? #0078D4 : #5A5A5A;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    // 记录点击时的鼠标位置作为气泡锚点。不能直接绑定 touch.mouse-x，
+    // 否则气泡会跟着鼠标移动，无法“避开鼠标”。
+    property <length> popup-x: 0px;
+    property <length> popup-y: 0px;
+
+    // 按钮交互：悬停仅驱动亮起（has-hover）；点击切换气泡显示
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            if tip.is-open {
+                tip.close();
+            } else {
+                popup-x = self.pressed-x + 16px;
+                popup-y = self.pressed-y + 16px;
+                tip.show();
+                close-timer.running = false;
+                close-timer.running = true;
+            }
+        }
+    }
+
+    // 提示气泡：锚定在点击位置右下方，避开鼠标
+    tip := PopupWindow {
+        close-policy: close-on-click;
+        x: popup-x;
+        y: popup-y;
+        width: tip-content.preferred-width;
+        height: tip-content.preferred-height;
+        tip-content := Rectangle {
+            background: #FFFFFF;
+            border-width: 1px;
+            border-color: #C0C0C0;
+            border-radius: 4px;
+            VerticalBox {
+                padding: 8px;
+                Text {
+                    text: root.tip-text;
+                    wrap: word-wrap;
+                    width: 260px;
+                    font-size: 11px;
+                    color: #333333;
+                }
+            }
+        }
+    }
+
+    // 15 秒自动隐藏（一次性定时器）
+    close-timer := Timer {
+        interval: 15000ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            tip.close();
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "x264video4osu";
+    width: 572px;
+    height: 545px;
+
+    in property <UiStrings> strings;
+
+    // ---------- 输入数据 ----------
+    in-out property <string> input-path: "";
+    in-out property <string> output-path: "";
+    in-out property <int> format-index: 0;
+    in property <int> mode-index: 0;          // 0 = CRF, 1 = 2pass（Rust 端跟踪）
+    in-out property <string> value-text: "26";
+    in-out property <string> width-text: "0";
+    in-out property <string> height-text: "720";
+    in-out property <bool> scale-up: false;
+    in-out property <bool> extract-audio: false;
+    in property <bool> encoding: false;
+    in property <bool> controls-enabled: true;
+    in-out property <int> language-index: 0;
+
+    // ---------- 进度 / 结果 ----------
+    in property <bool> progress-visible: false;
+    in property <bool> result-visible: false;
+    in property <float> progress-value: 0.0;   // 0..1
+    in property <string> pass-text: "";
+    in property <string> percent-text: "";
+    in property <string> eta-text: "";
+    in property <string> elapsed-text: "";
+    in property <string> output-size-text: "";
+
+    // 进度数据文字颜色：非运行灰色，编码时黑色
+    property <color> progress-text-color: root.encoding ? #000000 : #909090;
+
+    // ---------- 日志 ----------
+    in property <[string]> log-lines: [];
+    in-out property <bool> auto-scroll: true;
+
+    // ---------- 回调 ----------
+    callback browse-input();
+    callback browse-output();
+    callback start-encode();
+    callback stop-encode();
+    callback open-folder();
+    callback save-log();
+    callback show-about();
+    callback language-changed(int);
+    callback format-changed(int);
+    callback mode-changed(string);
+    callback scroll-log-to-end();
+
+    // 转发给日志组件，供 Rust 端在自动滚动时调用
+    scroll-log-to-end => { log-view.scroll-to-end(); }
+
+    VerticalBox {
+        padding: 6px;
+        spacing: 4px;
+
+        TabWidget {
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+
+            Tab { title: strings.tab-video;
+                Rectangle {
+                    background: #F8F9FA;
+                    border-width: 1px;
+                    border-color: #E0E0E0;
+                    border-radius: 4px;
+                    VerticalBox {
+                        padding: 6px;
+                        spacing: 2px;
+
+                        // ---- 输入文件 ----
+                        HorizontalBox {
+                            vertical-stretch: 0;
+                            height: 40px;
+                            spacing: 4px;
+                            Text { text: strings.label-input; width: 90px; vertical-alignment: center; }
+                            LineEdit { horizontal-stretch: 1; min-width: 240px; text <=> root.input-path; }
+                            Button { text: strings.button-browse; width: 50px; clicked => { root.browse-input(); } }
+                        }
+
+                        // ---- 输出文件 ----
+                        HorizontalBox {
+                            vertical-stretch: 0;
+                            spacing: 4px;
+                            Text { text: strings.label-output; width: 90px; vertical-alignment: center; }
+                            LineEdit { horizontal-stretch: 1; min-width: 240px; text <=> root.output-path; }
+                            Button { text: strings.button-browse; width: 50px; clicked => { root.browse-output(); } }
+                        }
+
+                        // ---- 分隔线 ----
+                        Rectangle { height: 1px; background: #E0E0E0; }
+
+                        // ---- 输出格式 ----
+                        HorizontalBox {
+                            vertical-stretch: 0;
+                            spacing: 4px;
+                            Text { text: strings.label-format; width: 90px; vertical-alignment: center; }
+                            ComboBox { width: 80px; model: ["flv", "avi", "mp4"]; current-index <=> root.format-index; selected => { root.format-changed(root.format-index); } }
+                            FormatTip { tip-text: strings.format-tip; }
+                        }
+
+                        // ---- 编码方式 ----
+                        HorizontalBox {
+                            vertical-stretch: 0;
+                            spacing: 4px;
+                            Text { text: strings.label-method; width: 90px; vertical-alignment: center; }
+                            RadioGroup { orientation: horizontal; selected(text) => { root.mode-changed(text); } RadioButton { text: "CRF"; checked: true; } RadioButton { text: "2pass"; } }
+                        }
+
+                        // ---- 数值框（2pass 码率 / CRF 质量） ----
+                        HorizontalBox {
+                            vertical-stretch: 0;
+                            spacing: 4px;
+                            Text { width: 90px; }
+                            LineEdit { width: 80px; text <=> root.value-text; }
+                        }
+
+                        // ---- 分辨率 ----
+                        HorizontalBox {
+                            vertical-stretch: 0;
+                            spacing: 4px;
+                            Text { text: strings.label-resolution; width: 90px; vertical-alignment: center; }
+                            Text { text: strings.label-width; vertical-alignment: center; }
+                            LineEdit { width: 60px; text <=> root.width-text; }
+                            Text { text: strings.label-height; vertical-alignment: center; }
+                            LineEdit { width: 60px; text <=> root.height-text; }
+                        }
+
+                        // ---- 复选项（左侧 10px 空白 margin） ----
+                        HorizontalBox {
+                            padding-left: 10px;
+                            CheckBox { horizontal-stretch: 1; vertical-stretch: 0; text: strings.check-scale-up; checked <=> root.scale-up; }
+                        }
+                        HorizontalBox {
+                            padding-left: 10px;
+                            CheckBox { horizontal-stretch: 1; vertical-stretch: 0; text: strings.check-extract-audio; checked <=> root.extract-audio; }
+                        }
+
+                        // ---- 弹性占位：吸收富余高度，让设置行保持紧凑不拉伸 ----
+                        Rectangle { vertical-stretch: 1; }
+
+                        // ---- 结果面板（编码结束后显示，置底） ----
+                        if (root.result-visible): HorizontalBox {
+                            spacing: 8px;
+                            Text { text: root.output-size-text; vertical-alignment: center; }
+                            Button { text: strings.button-open-folder; clicked => { root.open-folder(); } }
+                        }
+
+                        // ---- 进度面板：常驻显示，固定在标签页最底部 ----
+                        VerticalBox {
+                            spacing: 4px;
+                            // 高度 12px，对齐旧程序 MainWindow.xaml 中 <ProgressBar Height="12">
+                            ThickProgressBar { progress: root.progress-value; }
+                            HorizontalBox {
+                                spacing: 6px;
+                                Text { text: root.pass-text; width: 60px; vertical-alignment: center; color: root.progress-text-color; }
+                                Text { text: root.percent-text; width: 60px; vertical-alignment: center; color: root.progress-text-color; }
+                                Text { text: root.eta-text; width: 80px; vertical-alignment: center; color: root.progress-text-color; }
+                                Text { text: root.elapsed-text; horizontal-stretch: 1; vertical-alignment: center; color: root.progress-text-color; }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Tab { title: strings.tab-log;
+                Rectangle {
+                    background: #F8F9FA;
+                    border-width: 1px;
+                    border-color: #E0E0E0;
+                    border-radius: 4px;
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 6px;
+                        log-view := LogView {
+                            horizontal-stretch: 1;
+                            vertical-stretch: 1;
+                            log-lines: root.log-lines;
+                            auto-scroll: root.auto-scroll;
+                        }
+                        HorizontalBox {
+                            alignment: end;
+                            spacing: 10px;
+                            CheckBox { text: strings.check-auto-scroll; checked <=> root.auto-scroll; }
+                            Button { text: strings.button-save-log; clicked => { root.save-log(); } }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- 底部：开始/停止、语言、关于 ----
+        HorizontalBox {
+            alignment: end;
+            spacing: 10px;
+            Button { text: strings.button-start; enabled: !root.encoding && root.controls-enabled; min-width: 100px; clicked => { root.start-encode(); } }
+            Button { text: strings.button-stop; enabled: root.encoding; min-width: 100px; clicked => { root.stop-encode(); } }
+            ComboBox {
+                width: 90px;
+                model: ["中文", "English"];
+                current-index <=> root.language-index;
+                selected => { root.language-changed(root.language-index); }
+            }
+            Button { text: strings.button-about; clicked => { root.show-about(); } }
+        }
+    }
+}

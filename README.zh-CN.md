@@ -6,7 +6,7 @@
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
-![Framework](https://img.shields.io/badge/.NET-10.0-purple.svg)
+![Framework](https://img.shields.io/badge/UI-Slint%20%2B%20Rust-orange.svg)
 
 ## 动机
 
@@ -202,30 +202,39 @@ weightp=2, cabac=1, merange=32
 
 ### 技术栈
 
-- .NET 10.0 (WPF)
-- C# 12+
-- FFmpeg (通过命令行调用)
+- Rust（edition 2021）
+- Slint 1.17.1（UI 框架，Fluent 风格）+ winit 后端
+- femtovg 渲染器（OpenGL；本地 patch 修正 DPI 抗锯齿）
+- FFmpeg（通过命令行调用）
 
 ### 项目结构
 
 ```
 x264video4osu/
-├── Services/          # 核心服务层
-│   ├── FfmpegService.cs   # FFmpeg 封装
-│   └── FfmpegConfig.cs    # 配置管理
-├── Resources/         # 资源文件
-│   ├── Strings.zh-CN.xaml  # 中文资源
-│   └── Strings.en-US.xaml  # 英文资源
-├── tools/            # FFmpeg 工具存放目录
-├── MainWindow.xaml   # 主窗口
-└── AboutDialog.xaml  # 关于对话框
+├── src/                 # Rust 应用层
+│   ├── main.rs          # 入口：校验 FFmpeg 工具、运行事件循环
+│   ├── app.rs           # AppController：连接 UI 回调与编码服务
+│   ├── i18n.rs          # 全部 UI 字符串（zh-CN / en-US）
+│   ├── services/        # FFmpeg 参数、编码编排、工具定位
+│   ├── platform/        # 拖放、时间戳
+│   └── io/              # 打开链接 / 文件夹
+├── ui/                  # Slint UI 定义（.slint，构建期编译）
+│   ├── main.slint       # 主窗口
+│   └── dialogs/         # about / ffmpeg_not_found / message 对话框
+├── third_party/         # vendored i-slint-renderer-femtovg（DPI patch）
+├── build.rs             # slint_build 编译
+├── tools/               # FFmpeg 工具存放目录
+└── release/             # 构建好的发布包（exe + tools/）
 ```
 
 ### 构建
 
 ```bash
-dotnet build
+cargo build --release
+cargo test
 ```
+
+需要安装带 `x86_64-pc-windows-msvc` 目标的 Rust 工具链。Release 构建静态链接 CRT（见 `.cargo/config.toml`），产物是自包含 exe，无运行库依赖。
 
 ## 许可证
 

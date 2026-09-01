@@ -1,123 +1,52 @@
-# x264video4osu - AI Coding Agent Instructions
+# x264video4osu — AI Coding Agent Instructions
 
 ## Project Overview
-**x264video4osu** is a WPF desktop application for converting video files to MP4 format with x264 codec optimization, designed for the rhythm game osu!. Built with .NET 8, C#, and XAML.
+
+**x264video4osu** is a Windows desktop application (Rust + Slint 1.17.1) for compressing osu! background videos with FFmpeg/x264. It is the port of the original C#/WPF app and is functionally equivalent (2-Pass VBR / CRF, resolution scaling, audio extraction, real-time progress, bilingual UI).
 
 ## Architecture & Key Components
 
-### 1. **WPF Application Structure** (Model-View Pattern)
-- **MainWindow.xaml**: UI layer - controls, input fields, logging display
-- **MainWindow.xaml.cs**: Code-behind - handles user interactions and business logic coordination
-- **Services/**: Business logic and utility classes
+### UI layer — Slint (`.slint`, in `ui/`)
+- `ui/main.slint` — main window: tabs (video/log), input/output path, format ComboBox, CRF/2pass RadioGroup, resolution LineEdits, CheckBoxes, progress bar, start/stop buttons.
+- `ui/dialogs/` — `about.slint`, `ffmpeg_not_found.slint`, `message.slint` (compiled to Rust types by `build.rs`).
+- Slint files are compiled at **build time** via `slint_build` (see `build.rs`) — after editing `.slint` you MUST rebuild, otherwise the app runs a stale binary.
+- Fluent style; rendered by the **femtovg** renderer (winit backend).
 
-**Data Flow**: User Input (XAML) → Event Handler (Code-behind) → BuildFfmpegArgs() → FfmpegService → FFmpeg Process
-
-### 2. **Core Services**
-
-#### `FfmpegService` (Services/FfmpegService.cs)
-- Manages FFmpeg subprocess execution
-- **Start(args, log callback)**: Launches FFmpeg with specified arguments, streams stderr to UI via callback
-- **Stop()**: Terminates FFmpeg process tree with `Kill(true)`
-- Uses **asynchronous process monitoring** - error output is read line-by-line and invoked on UI thread
-- **Key pattern**: Pass `Action<string>` callback for logging to decouple service from UI
-
-#### `ScaleHelper` (Services/ScaleHelper.cs)
-- Static utility for FFmpeg scaling filter generation
-- Handles three scale modes:
-  - **Fixed dimensions**: `scale=w:h`
-  - **Proportional (no upscale)**: Conditional filters `if(gt(iw,w),w,iw)` to prevent upscaling
-  - **Proportional (upscale allowed)**: Direct `-1` for aspect preservation
-- Used in `BuildFfmpegArgs()` with width/height/upscale checkbox inputs
-
-### 3. **Video Encoding Pipeline**
-
-FFmpeg arguments are built with **two-pass encoding** (internally stored):
-- **Pass 1**: Analysis pass → `NUL` (Windows null device)
-- **Pass 2**: Final encode → output MP4 with `+faststart` flag
-- **x264 Parameters**: Highly optimized for osu! beatmap videos:
-  - `preset=veryslow` (quality over speed)
-  - `profile=high`, `level=5.2` (compatibility)
-  - `ref=16`, `bframes=16`, `me=umh` (quality settings)
-  - `rc-lookahead=60`, `aq-mode=3`, `psy-rd=1.0,0.15` (perceptual optimization)
+### Rust application layer — `src/`
+- `main.rs` — entry point; validates FFmpeg tools first, runs the event loop. Includes the generated `.slint` types.
+- `app.rs` — `AppController`: owns the UI handle, wires callbacks ↔ services, drives the log list and progress updates. Contains a 100ms `Timer` workaround (see below).
+- `i18n.rs` — all UI strings per language (zh-CN / en-US); applied in bulk by `UiStrings`.
+- `error.rs` — `AppError` enum (`AppResult = Result<T, AppError>`).
+- `services/` — FFmpeg argument building (`args.rs`), encoding orchestration (`ffmpeg.rs`), tool discovery (`ffmpeg_config.rs`), scale filter (`scale.rs`), path utilities (`pathutil.rs`).
+- `platform/` — drag-drop, timestamps (via `windows-sys` `GetLocalTime`).
+- `io/` — opening URLs / folders.
 
 ## Critical Developer Workflows
 
 ### Build & Run
 ```bash
-dotnet build
-dotnet run  # Or launch from Visual Studio
+cargo build          # dev
+cargo build --release
+cargo test
 ```
 
-### Dependencies
-- **.NET 8 SDK** with WPF support (`UseWPF=true` in .csproj)
-- **FFmpeg** executable (must be in PATH)
-- No NuGet packages required (uses only .NET stdlib)
+### Runtime requirements
+- FFmpeg tools `ffmpeg.exe` + `ffprobe.exe` must exist in a `tools/` folder **next to the executable** (or relative to cwd). The app shows a "download / exit" dialog when missing.
+- Release is built with static CRT (`.cargo/config.toml` → `+crt-static`), so the exe has no VC++ runtime dependency.
 
-### Debugging Tips
-- **Process output**: Set breakpoint in `FfmpegService.Start()` - stderr output is received asynchronously
-- **UI thread safety**: All UI updates use `Dispatcher.Invoke()` - required because FFmpeg callback runs on different thread
-- **Drag-drop input**: Handled by `Input_Drop()` event attached to Window `AllowDrop=true`
+### Known gotchas (VERY IMPORTANT — do not regress these)
+- **femtovg renderer patch**: `third_party/i-slint-renderer-femtovg` is a vendored copy with a local patch — device pixel ratio is fixed at `1.0` because Slint draws in physical pixels; the upstream `ceil(scale_factor)` logic produced 0.5px AA fringes (jagged radio buttons/checkboxes at 125% DPI). Do NOT delete the `[patch.crates-io]` entry in `Cargo.toml` or revert that file.
+- **Log view**: `LogView` in `ui/main.slint` uses `ListView` (one row per line). Do NOT switch it to "ScrollView + single Text" — the width binding creates a binding loop that never overflows, breaking scrolling. Auto-scroll sets `viewport-y` to a NEGATIVE value (scroll offset is `-viewport-y`).
+- **Slint expression limits**: no `100% - 2px` style arithmetic; use `parent.width - 2px`.
+- **app.rs 100ms Timer**: a periodic timer exists as a workaround for a Slint window-size/DPI issue — don't remove it casually.
+- **Layout gotchas**: layout children have no `margin` property (use `padding-left` on a wrapping `HorizontalBox`); fluent `RadioGroup` default stretching spreads buttons apart.
+- **Tooltip/format hint**: a click-opens popup (`FormatTip`), not hover — hover-only had a `has-hover` flicker issue.
 
-## Code Conventions & Patterns
+## Code Conventions
 
-### Naming
-- **Private fields**: `_camelCase` prefix (e.g., `_ffmpeg`, `_log`)
-- **XAML element names**: `PascalCaseBox`/`PascalCaseCheck` suffixes (e.g., `InputPathBox`, `ScaleUpCheck`)
-- **Methods**: PascalCase, event handlers append `_Click` or `_Changed`
+- **Comments**: Chinese, explaining *why* (they document workarounds and the correspondence to the old C# program). Keep them.
+- Errors propagate as `AppError`; services return `AppResult`.
+- Tests live in `#[cfg(test)]` modules next to code (e.g. `src/services/args.rs`, `src/log_layout_test.rs`). `cargo test` uses `i-slint-backend-testing`; real-ffmpeg end-to-end tests exist in `services::ffmpeg`.
 
-### C# Features
-- **File-scoped namespaces**: `namespace x264video4osu;` (modern C# style)
-- **Nullable reference types**: Enabled (`<Nullable>enable</Nullable>`)
-- **Implicit usings**: Enabled
-- **Readonly fields**: `private readonly FfmpegService _ffmpeg = new();`
-- **String interpolation**: `$"{variable}"` with escaping for paths `\"{path}\"`
-
-### XAML Patterns
-- **Resource bindings**: `{DynamicResource KeyName}` for i18n strings (see Resources/Strings.*.xaml)
-- **Layout**: Grid with explicit row/column definitions + Border containers for sections
-- **Height consistency**: Most interactive elements use `Height="36"` or `"44"`
-- **Margins**: `Margin="0,0,12,8"` for spacing (right, bottom emphasis)
-
-### Localization
-- **Two languages**: Chinese (zh-CN) and English (en-US)
-- **Resource files**: XAML-based at `Resources/Strings.{lang}.xaml`
-- **Runtime switching**: `LanguageChanged()` clears and reloads resource dictionaries
-- **All UI strings**: Stored as `{DynamicResource}` bindings, not hardcoded
-
-## Integration Points & External Dependencies
-
-### FFmpeg Integration
-- **Command structure**: `-i input.mp4 -vf "FILTER" -c:v libx264 [OPTIONS] output.mp4`
-- **Key flags**:
-  - `-pass 1/2`: Two-pass encoding
-  - `-vf`: Video filter (scale, etc.)
-  - `-x264-params`: Raw x264 codec options
-  - `-movflags +faststart`: Enable YouTube-style streaming
-  - `-an`: Remove audio (unless ExtractAudioCheck implemented)
-- **Process interaction**: Windows null device `NUL` for pass 1 output
-
-### Logging & User Feedback
-- **Log accumulation**: `StringBuilder _log` persists entire session
-- **Real-time UI update**: `LogBox.Text = _log.ToString()` on each line + `ScrollToEnd()`
-- **Persistence**: `SaveLog_Click()` writes to `log.txt`
-
-## Common Modification Points
-
-| Task | Files | Notes |
-|------|-------|-------|
-| Add encoding options | MainWindow.xaml, BuildFfmpegArgs() | Add TextBox, parse value, append to args string |
-| Change video codec | FfmpegService, BuildFfmpegArgs() | Replace `-c:v libx264` and x264-params |
-| Modify UI layout | MainWindow.xaml | Adjust Grid rows/columns or Border padding |
-| Add language | Resources/Strings.{lang}.xaml | Create new resource file, add to LanguageBox combobox |
-| Extract audio feature | MainWindow.xaml.cs, BuildFfmpegArgs() | Conditionally add `-c:a aac` based on checkbox |
-
-## Testing Strategy
-- **Manual integration testing**: Drag video file → adjust params → click Start → verify output
-- **FFmpeg validation**: Check log for encoding errors (lines starting with "error" or "Error")
-- **Process termination**: Click Stop button should cleanly kill FFmpeg process
-
-## Notes for AI Agents
-- **Thread safety critical**: FFmpeg async output requires `Dispatcher.Invoke()` for any UI changes
-- **Error handling**: Currently minimal - stderr from FFmpeg is logged but not parsed for errors
-- **Path handling**: Always quote paths with `\"{path}\"` when building FFmpeg args (spaces in filenames)
-- **Two-pass encoding**: `_ffmpeg.Pass1Args` is stored internally for future pass 1 execution (currently pass 1 outputs to NUL)
+## Testing
+- `cargo test` runs unit tests + headless UI layout tests + (when ffmpeg present) real encodes. All must pass.

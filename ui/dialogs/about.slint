@@ -1,0 +1,62 @@
+import { Button, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+export component AboutDialog inherits Window {
+    title: root.dialog-title;
+    width: 440px;
+    height: 420px;
+    background: #F9FAFB;
+
+    in property <string> dialog-title;
+    in property <string> description;
+    in property <string> version-line;
+    in property <string> repository-text;
+    in property <string> manual-text;
+    in property <string> close-text;
+
+    callback open-repository();
+    callback open-manual();
+    callback close-dialog();
+
+    VerticalBox {
+        padding: 32px;
+        spacing: 8px;
+
+        Text {
+            text: "x264video4osu";
+            font-size: 26px;
+            font-weight: 600;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.version-line;
+            font-size: 13px;
+            color: #6B7280;
+            horizontal-alignment: center;
+        }
+        Rectangle { height: 24px; }
+        Text {
+            text: root.description;
+            font-size: 14px;
+            wrap: word-wrap;
+            horizontal-alignment: center;
+        }
+        Rectangle { height: 32px; }
+        Button {
+            text: root.repository-text;
+            clicked => { root.open-repository(); }
+        }
+        Button {
+            text: root.manual-text;
+            clicked => { root.open-manual(); }
+        }
+        Rectangle { height: 0px; vertical-stretch: 1; }
+        HorizontalBox {
+            alignment: center;
+            Button {
+                text: root.close-text;
+                width: 100px;
+                clicked => { root.close-dialog(); }
+            }
+        }
+    }
+}

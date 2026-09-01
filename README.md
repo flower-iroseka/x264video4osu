@@ -6,7 +6,7 @@ A tool for encoding osu! background videos.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
-![Framework](https://img.shields.io/badge/.NET-10.0-purple.svg)
+![Framework](https://img.shields.io/badge/UI-Slint%20%2B%20Rust-orange.svg)
 
 ## Motivation
 
@@ -30,7 +30,7 @@ This is just an FFmpeg frontend to solve my personal video compression needs. Ev
 
 ### Requirements
 
-The following files are required in the `tools` folder:
+The following files are required in the `tools` folder (next to the executable):
 
 - `ffmpeg.exe`
 - `ffprobe.exe`
@@ -41,11 +41,13 @@ Download from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (GPL builds with x
 
 ### Usage
 
-1. Place `ffmpeg.exe` and `ffprobe.exe` in the `tools` folder
+1. Place `ffmpeg.exe` and `ffprobe.exe` in the `tools` folder (next to `x264video4osu.exe`)
 2. Run `x264video4osu.exe`
 3. Select input video file
 4. Configure encoding parameters (or use defaults)
 5. Click "Start" to encode
+
+> The release exe is a single self-contained binary (static CRT) — no VC++ runtime or .NET install required. Just copy the exe + `tools/` folder to any Windows 10/11 machine.
 
 ## Encoding Modes
 
@@ -202,30 +204,39 @@ weightp=2, cabac=1, merange=32
 
 ### Tech Stack
 
-- .NET 10.0 (WPF)
-- C# 12+
+- Rust (edition 2021)
+- Slint 1.17.1 (UI framework, Fluent style) + winit backend
+- femtovg renderer (OpenGL; vendored local patch for correct DPI anti-aliasing)
 - FFmpeg (via command-line invocation)
 
 ### Project Structure
 
 ```
 x264video4osu/
-├── Services/          # Core service layer
-│   ├── FfmpegService.cs   # FFmpeg wrapper
-│   └── FfmpegConfig.cs    # Configuration management
-├── Resources/         # Resource files
-│   ├── Strings.zh-CN.xaml  # Chinese resources
-│   └── Strings.en-US.xaml  # English resources
-├── tools/            # FFmpeg tools directory
-├── MainWindow.xaml   # Main window
-└── AboutDialog.xaml  # About dialog
+├── src/                 # Rust application layer
+│   ├── main.rs          # Entry point; validates FFmpeg tools, runs event loop
+│   ├── app.rs           # AppController: wires UI callbacks ↔ services
+│   ├── i18n.rs          # All UI strings (zh-CN / en-US)
+│   ├── services/        # FFmpeg args, encoding orchestration, tool discovery
+│   ├── platform/        # Drag-drop, timestamps
+│   └── io/              # Opening URLs / folders
+├── ui/                  # Slint UI definitions (.slint, compiled at build time)
+│   ├── main.slint       # Main window
+│   └── dialogs/         # about / ffmpeg_not_found / message dialogs
+├── third_party/         # Vendored i-slint-renderer-femtovg (DPI patch)
+├── build.rs             # slint_build compilation
+├── tools/               # FFmpeg tools directory
+└── release/             # Built release bundle (exe + tools/)
 ```
 
 ### Build
 
 ```bash
-dotnet build
+cargo build --release
+cargo test
 ```
+
+Requires a Rust toolchain with the `x86_64-pc-windows-msvc` target. The release build statically links the CRT (see `.cargo/config.toml`), producing a self-contained exe with no runtime dependencies.
 
 ## License
 

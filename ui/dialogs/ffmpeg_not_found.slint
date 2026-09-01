@@ -1,0 +1,41 @@
+import { Button, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+export component FfmpegNotFoundDialog inherits Window {
+    title: root.dialog-title;
+    width: 460px;
+    height: 220px;
+    background: #F9FAFB;
+
+    in property <string> dialog-title;
+    in property <string> message;
+    in property <string> download-text;
+    in property <string> exit-text;
+
+    callback download();
+    callback exit-dialog();
+
+    VerticalBox {
+        padding: 20px;
+        spacing: 16px;
+
+        Text {
+            text: root.message;
+            wrap: word-wrap;
+        }
+        Rectangle { height: 0px; vertical-stretch: 1; }
+        HorizontalBox {
+            alignment: end;
+            spacing: 12px;
+            Button {
+                text: root.download-text;
+                width: 130px;
+                clicked => { root.download(); }
+            }
+            Button {
+                text: root.exit-text;
+                width: 130px;
+                clicked => { root.exit-dialog(); }
+            }
+        }
+    }
+}

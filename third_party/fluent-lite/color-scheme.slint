@@ -1,0 +1,8 @@
+// Copyright © SixtyFPS GmbH <info@slint.dev>
+// SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
+
+export global ColorSchemeSelector  {
+    // 自定义风格始终使用浅色配色（主色为 Windows/VS Code 默认蓝 #0078D4）。SlintInternal 仅在 builtin
+    // 风格里可见，文件系统加载的自定义风格访问不到，因此写死 ColorScheme.light。
+    in property <ColorScheme> color-scheme: ColorScheme.light;
+}

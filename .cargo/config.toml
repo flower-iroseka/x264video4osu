@@ -1,0 +1,4 @@
+# 静态链接 MSVC CRT（vcruntime/msvcp/ucrt），使 release exe 不依赖 VC++ 运行库，
+# 可在任意 Windows（含未装 VC++ Redistributable 的机器）上直接运行。
+[target.'cfg(target_os = "windows")']
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,28 +1,16 @@
-# Build results
-[Dd]ebug/
-[Dd]ebugPublic/
-[Rr]elease/
-[Rr]eleases/
-x64/
-x86/
-[Ww][Ii][Nn]32/
-[Aa][Rr][Mm]/
-[Aa][Rr][Mm]64/
-bld/
-[Bb]in/
-[Oo]bj/
-[Ll]og/
-[Ll]ogs/
+# Rust / Cargo build output
+/target
 
-# Visual Studio cache/options directory
-.vs/
+# Cargo-generated lockfile backups
+Cargo.lock.orig
+*.orig
 
-# Rider
-.idea/
+# Slint debug logs (from the app's logging backend)
+log_*.log
+log_*.log.mbtree
 
-# Visual Studio Code
-.vscode/*
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
+# Release bundle (built artifacts, ffmpeg/ffprobe are large binaries)
+/release
+
+# Claude Code local settings
+.claude/settings.local.json
