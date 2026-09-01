@@ -28,7 +28,6 @@ const TITLE_ERROR: &str = "Error";
 
 // ---------- 项目链接（对应旧程序 AppConfig；GitHubIssuesUrl 在旧程序中未被使用） ----------
 const REPO_URL: &str = "https://github.com/flower-iroseka/x264video4osu";
-const WIKI_URL: &str = "https://github.com/flower-iroseka/x264video4osu/wiki";
 
 pub struct AppController {
     ui: crate::MainWindow,
@@ -333,16 +332,11 @@ impl AppController {
         dialog.set_version_line(self.strings.about_version_line.clone().into());
         dialog.set_description(self.strings.about_description.clone().into());
         dialog.set_repository_text(self.strings.repository_text.clone().into());
-        dialog.set_manual_text(self.strings.manual_text.clone().into());
         dialog.set_close_text(self.strings.close_text.clone().into());
 
         let url_repo = REPO_URL.to_string();
-        let url_wiki = WIKI_URL.to_string();
         dialog.on_open_repository(move || {
             let _ = crate::io::external::open_url(&url_repo);
-        });
-        dialog.on_open_manual(move || {
-            let _ = crate::io::external::open_url(&url_wiki);
         });
         let weak = dialog.as_weak();
         dialog.on_close_dialog(move || {

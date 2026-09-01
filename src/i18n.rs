@@ -25,7 +25,6 @@ pub struct Strings {
     pub about_version_line: String,
     pub about_description: String,
     pub repository_text: String,
-    pub manual_text: String,
     pub close_text: String,
     /// FFmpeg 缺失对话框
     pub not_found_title: String,
@@ -64,7 +63,6 @@ fn zh() -> Strings {
         about_version_line: format!("版本 {0}", display_version()),
         about_description: "osu! 视频压制工具\n\n使用 x264 编码器为 osu! 制作兼容的背景视频。".into(),
         repository_text: "项目仓库".into(),
-        manual_text: "使用说明".into(),
         close_text: "关闭".into(),
         not_found_title: "未找到 FFmpeg".into(),
         not_found_message: format!(
@@ -104,7 +102,6 @@ fn en() -> Strings {
         about_version_line: format!("Version {0}", display_version()),
         about_description: "osu! video compression tool\n\nUses x264 encoder to create osu! compatible background video.".into(),
         repository_text: "Project Repository".into(),
-        manual_text: "User Manual".into(),
         close_text: "Close".into(),
         not_found_title: "FFmpeg Not Found".into(),
         not_found_message: format!(

@@ -5863,7 +5863,7 @@ checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 
 [[package]]
 name = "x264video4osu"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "i-slint-backend-testing",
  "i-slint-compiler",

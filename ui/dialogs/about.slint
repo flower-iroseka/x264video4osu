@@ -10,11 +10,9 @@ export component AboutDialog inherits Window {
     in property <string> description;
     in property <string> version-line;
     in property <string> repository-text;
-    in property <string> manual-text;
     in property <string> close-text;
 
     callback open-repository();
-    callback open-manual();
     callback close-dialog();
 
     VerticalBox {
@@ -44,10 +42,6 @@ export component AboutDialog inherits Window {
         Button {
             text: root.repository-text;
             clicked => { root.open-repository(); }
-        }
-        Button {
-            text: root.manual-text;
-            clicked => { root.open-manual(); }
         }
         Rectangle { height: 0px; vertical-stretch: 1; }
         HorizontalBox {
