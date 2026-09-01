@@ -1,6 +1,6 @@
 # x264video4osu
 
-[![en](https://img.shields.io/badge/lang-en-blue.svg)](README.md) [![zh](https://img.shields.io/badge/lang-zh-red.svg)](README.zh-CN.md)
+**中文** · [English](README.md)
 
 一个用于编码 osu! 背景视频的工具。
 

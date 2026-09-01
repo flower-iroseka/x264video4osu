@@ -1,6 +1,6 @@
 # x264video4osu
 
-[![en](https://img.shields.io/badge/lang-en-blue.svg)](README.md) [![zh](https://img.shields.io/badge/lang-zh-red.svg)](README.zh-CN.md)
+**English** · [中文](README.zh-CN.md)
 
 A tool for encoding osu! background videos.
 
