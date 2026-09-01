@@ -51,9 +51,43 @@ Download from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (GPL builds with x
 
 ## Encoding Modes
 
-The program offers two main encoding modes:
+The program offers two main encoding modes. **CRF is the recommended default** for osu! background videos (typically anime OPs): it's fast, and animation content compresses so well that a moderate CRF already looks great at low bitrate. Use **2-Pass** when you must hit a precise file size without iterating.
 
-### 2-Pass VBR Mode (Recommended for osu! Backgrounds)
+### CRF Mode (Constant Rate Factor) — Recommended Default
+
+**How it works**: Constant quality factor encoding, prioritizing quality over file size.
+
+| Item | Description |
+|------|-------------|
+| **Control method** | CRF value (range 0-51) |
+| **Default value** | 26 |
+| **Value meaning** | Lower value = better quality, larger file; higher value = lower quality, smaller file |
+| **Output size** | Unpredictable (depends on video content complexity) |
+| **Encoding speed** | Fast (single pass) |
+| **Use case** | Most osu! background videos — especially anime OPs at low bitrate |
+
+**CRF value reference**:
+
+| CRF value | Quality | Description |
+|-----------|---------|-------------|
+| 18-23 | Higher | Near-lossless, larger file |
+| 23-26 | Mid-high | Suitable for general purposes |
+| 26-28 | Medium | General use, controllable file size |
+| 28-32 | Lower | For low-bandwidth scenarios |
+| 32+ | Low | Not recommended for background videos |
+
+**Advantages**:
+- ✅ Fast encoding speed (single pass)
+- ✅ Simple configuration (only one quality value)
+- ✅ **Anime OPs at low bitrate**: animation has clean edges and large flat-color regions, so a moderate CRF (26-28) relatively easily yields a satisfying result at a small file size
+
+**Disadvantages**:
+- ❌ File size is unpredictable — expect to encode a few times, adjusting the CRF value, until you land in the desired size range
+- ❌ Complex or noisy scenes can exceed the osu! file size limit
+
+---
+
+### 2-Pass VBR Mode (for Strict File-Size Control)
 
 **How it works**: First pass scans the video to analyze complexity, second pass allocates bitrate based on the analysis.
 
@@ -63,10 +97,10 @@ The program offers two main encoding modes:
 | **Default value** | 800 kbps |
 | **Output size** | Precisely controlled (bitrate × duration ≈ file size) |
 | **Encoding speed** | Slower (requires two passes) |
-| **Use case** | Projects with strict file size requirements |
+| **Use case** | Set-and-forget: a strict size budget, no desire to iterate on CRF |
 
 **Advantages**:
-- ✅ Predictable and precisely controlled file size
+- ✅ Predictable and precisely controlled file size — set the bitrate, click start, walk away
 - ✅ Allocates more bits to complex scenes, saves bits on simple scenes
 
 **Disadvantages**:
@@ -85,51 +119,22 @@ The program offers two main encoding modes:
 
 ---
 
-### CRF Mode (Constant Rate Factor)
-
-**How it works**: Constant quality factor encoding, prioritizing quality over file size.
-
-| Item | Description |
-|------|-------------|
-| **Control method** | CRF value (range 0-51) |
-| **Default value** | 26 |
-| **Value meaning** | Lower value = better quality, larger file; higher value = lower quality, smaller file |
-| **Output size** | Unpredictable (depends on video content complexity) |
-| **Encoding speed** | Fast (single pass) |
-| **Use case** | Quality-first projects with relaxed file size requirements |
-
-**CRF value reference**:
-
-| CRF value | Quality | Description |
-|-----------|---------|-------------|
-| 18-23 | Higher | Near-lossless, larger file |
-| 23-26 | Mid-high | Suitable for general purposes |
-| 26-28 | Medium | General use, controllable file size |
-| 28-32 | Lower | For low-bandwidth scenarios |
-| 32+ | Low | Not recommended for background videos |
-
-**Advantages**:
-- ✅ Fast encoding speed
-- ✅ Simple configuration (only need to set one quality value)
-
-**Disadvantages**:
-- ❌ Cannot precisely control file size
-- ❌ Complex scenes may exceed osu! file size limit
-
----
-
 ## Recommended Configuration (osu! Background Videos)
 
-For typical osu! background videos (under 2 minutes, < 15MB requirement), the following configuration is recommended:
+For typical osu! background videos (usually anime OPs, under 2 minutes, < 15MB requirement):
 
 | Parameter | Recommended value | Description |
 |-----------|-------------------|-------------|
-| Encoding mode | **2-Pass** | Precise file size control |
-| Bitrate | **800-1000 kbps** | Adjust based on video length |
+| Encoding mode | **CRF** (default) | Animation compresses well; iterate the CRF value to hit your size |
+| CRF | **26-28** | Start at 26, then adjust by 1-2 to tune the output size |
 | Resolution | **720p or original** | Keep vertical aspect ratio |
 | FPS | **24** | Frame rate setting |
 
-**Bitrate selection guide**:
+**Quick workflow**: encode once at CRF 26. If the file is too large, raise CRF by 1-2 and re-encode; if you have room to spare, lower it for better quality. Because anime OPs compress so efficiently, you'll usually settle on a satisfying size after one or two tries.
+
+**Prefer set-and-forget?** If you must fit a fixed budget exactly — e.g. a beatmap with a strict file-size limit — skip the iteration and use **2-Pass** with an estimated bitrate. It costs roughly twice the encode time, but the output size lands predictably on the first try.
+
+**Bitrate selection guide** (for 2-Pass):
 
 - Video duration under 1 minute: `800-1000 kbps`
 - Video duration 1-1.5 minutes: `700-900 kbps`
