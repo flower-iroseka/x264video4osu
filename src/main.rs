@@ -13,14 +13,20 @@ mod i18n;
 mod io;
 mod platform;
 mod services;
+mod win_flash;
 #[cfg(test)]
 mod log_layout_test;
+#[cfg(test)]
+mod method_row_layout_test;
+#[cfg(test)]
 mod res_row_layout_test;
 
 include!(concat!(env!("OUT_DIR"), "/main.rs"));
 include!(concat!(env!("OUT_DIR"), "/about.rs"));
 include!(concat!(env!("OUT_DIR"), "/ffmpeg_not_found.rs"));
 include!(concat!(env!("OUT_DIR"), "/message.rs"));
+
+use crate::app::wire_title_bar;
 
 fn main() {
     // 先校验 FFmpeg / ffprobe 工具，缺失时展示提示对话框；无论点击哪个按钮
@@ -38,12 +44,20 @@ fn main() {
 /// 展示「未找到 FFmpeg」对话框；两个按钮（下载/退出）都会关闭对话框，
 /// 之后调用方以退出码 1 结束进程。
 fn show_tools_missing_dialog() {
-    let strings = i18n::for_lang(i18n::default_lang());
+    // 用持久化的语言与主题构造对话框（与主窗口一致；首次运行回落默认中文 + 默认主题）
+    let settings = services::settings::load();
+    let lang = if settings.lang_index == 0 { i18n::Lang::Zh } else { i18n::Lang::En };
+    let strings = i18n::for_lang(lang);
     let dialog = crate::FfmpegNotFoundDialog::new().expect("failed to create ffmpeg-not-found dialog");
+    wire_title_bar!(dialog);
+    dialog.invoke_apply_theme(settings.theme_index);
     dialog.set_dialog_title(strings.not_found_title.into());
     dialog.set_message(strings.not_found_message.into());
     dialog.set_download_text(strings.download_text.into());
     dialog.set_exit_text(strings.exit_text.into());
+    dialog.set_titlebar_tooltip_minimize(strings.titlebar_minimize.into());
+    dialog.set_titlebar_tooltip_maximize(strings.titlebar_maximize.into());
+    dialog.set_titlebar_tooltip_close(strings.titlebar_close.into());
 
     let url = services::ffmpeg_config::download_url().to_string();
     let weak = dialog.as_weak();

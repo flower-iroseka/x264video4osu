@@ -1,6 +1,6 @@
 [package]
 name = "x264video4osu"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 description = "Rust + Slint port of x264video4osu (osu! background video compressor)"
 license = "MIT"
@@ -18,8 +18,14 @@ uuid = { version = "1.16", features = ["v4"] }
 open = "5.4.2"
 # 仅用 GetLocalTime 生成时间戳（旧程序使用 DateTime.Now 格式化）
 # windows-sys 0.61 中 GetLocalTime 位于 Win32_System_SystemInformation，
-# SYSTEMTIME 位于 Win32_Foundation（随该 feature 一并启用）
-windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+# SYSTEMTIME 位于 Win32_Foundation（随该 feature 一并启用）。
+# Win32_UI_WindowsAndMessaging 用于关于窗口的「点击主窗口 → 标题栏闪烁」：
+# WH_MOUSE_LL 低级鼠标钩子（SetWindowsHookExW / CallNextHookEx / WindowFromPoint）。
+windows-sys = { version = "0.61", features = [
+    "Win32_System_SystemInformation",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 i-slint-backend-testing = "1.17.1"

@@ -9,6 +9,7 @@ import { ScrollView } from "./scrollview.slint";
 export component ComboBox {
     in property <[string]> model <=> base.model;
     in property <bool> enabled <=> base.enabled;
+    in property <string> tooltip-text: "";
     out property <bool> has-focus <=> base.has-focus;
     in-out property <int> current-index <=> base.current-index;
     in-out property <string> current-value <=> base.current-value;
@@ -40,13 +41,13 @@ export component ComboBox {
             icon.colorize: FluentPalette.text-disabled;
         }
         pressed when base.pressed : {
-            background.background: FluentPalette.control-alt-tertiary;
+            background.background: FluentPalette.is-aero ? @linear-gradient(180deg, #A8D4EE 0%, #C2E7FA 48%, #EAF9FF 100%) : FluentPalette.control-alt-tertiary;
             background.border-color: FluentPalette.border;
             text.color: FluentPalette.text-secondary;
             icon.colorize: FluentPalette.text-tertiary;
         }
         hover when base.has-hover : {
-            background.background: FluentPalette.control-secondary;
+            background.background: FluentPalette.is-aero ? @linear-gradient(180deg, #FFFFFF 0%, #E6F7FF 48%, #C3E9FB 100%) : FluentPalette.control-secondary;
         }
     ]
 
@@ -64,11 +65,24 @@ export component ComboBox {
 
     background := Rectangle {
         border-radius: 3px;
-        background: FluentPalette.control-background;
+        // Aero：XP/Vista 光泽（竖直流光渐变 + 上缘高光带）；默认主题：经典平面 control-background
+        background: FluentPalette.is-aero ? @linear-gradient(180deg, #FFFFFF 0%, #D6EDFB 48%, #A9D8F2 100%) : FluentPalette.control-background;
         border-width: 1px;
         border-color: FluentPalette.control-border;
+        clip: true;
 
         animate border-color { duration: 200ms; }
+
+        Rectangle {
+            visible: FluentPalette.is-aero;
+            x: 1px;
+            y: 1px;
+            width: parent.width - 2px;
+            height: 46%;
+            background: @linear-gradient(180deg, #FFFFFFD9 0%, #FFFFFF2E 100%);
+            opacity: base.pressed ? 0.35 : 0.9;
+            animate opacity { duration: 150ms; }
+        }
 
         layout := HorizontalLayout {
             padding-left: 11px;
@@ -93,6 +107,26 @@ export component ComboBox {
                 accessible-role: none;
 
                 animate colorize { duration: 150ms; }
+            }
+        }
+
+        if (root.tooltip-text != ""): Tooltip {
+            Rectangle {
+                background: FluentPalette.alternate-background;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: FluentPalette.border;
+                VerticalLayout {
+                    padding-left: 9px;
+                    padding-right: 9px;
+                    padding-top: 6px;
+                    padding-bottom: 6px;
+                    Text {
+                        text: root.tooltip-text;
+                        font-size: 12px;
+                        color: FluentPalette.foreground;
+                    }
+                }
             }
         }
     }

@@ -9,6 +9,7 @@ export component CheckBox {
     in property <bool> enabled <=> touch-area.enabled;
     in property <length> font-size;
     in property <int> font-weight;
+    in property <string> tooltip-text: "";
     out property <bool> has-focus: focus-scope.has-focus;
     in-out property <bool> checked;
 
@@ -59,10 +60,21 @@ export component CheckBox {
             width: 18px;
             height: self.width;
             y: (parent.height - self.height) / 2;
-            background: FluentPalette.control-alt-secondary;
+            // Aero：微妙玻璃渐变 + 上缘高光；默认主题：经典平面 control-alt-secondary
+            background: FluentPalette.is-aero ? @linear-gradient(180deg, #FFFFFF 0%, #E2F4FD 100%) : FluentPalette.control-alt-secondary;
             border-radius: 2px;
+            clip: true;
 
             animate background, border-color { duration: 150ms; }
+
+            Rectangle {
+                visible: FluentPalette.is-aero;
+                x: 1px;
+                y: 1px;
+                width: parent.width - 2px;
+                height: 8px;
+                background: @linear-gradient(180deg, #FFFFFFE6 0%, #FFFFFF30 100%);
+            }
 
             border := Rectangle {
                 border-color: FluentPalette.control-strong-stroke;
@@ -94,11 +106,22 @@ export component CheckBox {
 
     touch-area := TouchArea {
         clicked => {
+            // 点击时把焦点让给不可见目标，使正在编辑的文本框失焦
+            focus-blank.focus();
             if (root.enabled) {
                 root.checked = !root.checked;
                 root.toggled();
             }
         }
+    }
+
+    // 不可见焦点清除目标：宽度 0、不参与点击与 Tab 遍历，仅作 `focus()` 接收端
+    focus-blank := FocusScope {
+        x: 0;
+        width: 0;
+        height: 0;
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
     }
 
     focus-scope := FocusScope {
@@ -118,5 +141,26 @@ export component CheckBox {
     // focus border
     if root.has-focus && root.enabled : FocusBorder {
         border-radius: 4px;
+    }
+
+    // Tooltip 必须排在 touch-area 之后（更上层），TooltipArea 才能收到鼠标事件
+    if (root.tooltip-text != ""): Tooltip {
+        Rectangle {
+            background: FluentPalette.alternate-background;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: FluentPalette.border;
+            VerticalLayout {
+                padding-left: 9px;
+                padding-right: 9px;
+                padding-top: 6px;
+                padding-bottom: 6px;
+                Text {
+                    text: root.tooltip-text;
+                    font-size: 12px;
+                    color: FluentPalette.foreground;
+                }
+            }
+        }
     }
 }

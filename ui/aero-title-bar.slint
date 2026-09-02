@@ -1,0 +1,171 @@
+// Frutiger Aero 自定义标题栏。
+//
+// 无边框窗口（Window 上设置 `no-frame: true`）下替代原生标题栏：
+// 天空渐变玻璃条 + 顶部高光带 + 三个玻璃按钮（最小化 / 最大化 / 关闭）。
+// 整条底衬是可拖拽区（按下时通知 Rust 端调 winit 的 drag_window，走原生
+// HTCAPTION 拖拽，保留 Aero snap）；三个按钮浮在拖拽区之上，各自拦截点击。
+//
+// 窗口为固定尺寸（不可缩放、不可最大化），故最大化按钮永久禁用：仅展示
+// 图标，悬停有工具提示、点击无动作；标题栏双击也不做最大化还原。
+//
+// 按下检测：`pressed => {}` 是属性变化钩子（不是回调），编译器会拒绝，
+// 也会在按下与释放时都触发。改用 pointer-event 回调 + kind == down + 左键判定。
+//
+// 按钮图标用 Segoe MDL2 Assets 的窗口控制字形（E921 最小化 / E922 最大化 /
+// E8BB 关闭），显式指定字体族，避免默认字体缺字形显示成方框。
+
+import { FluentPalette } from "styling.slint";
+
+// 标题栏按钮：玻璃半透明底 + 顶部高光带（XP/Vista 光泽面）。悬停泛白、按下加深；
+// danger（关闭钮）为红色玻璃。禁用时（最大化钮）变扁平灰、不响应悬停与点击。
+component CaptionButton inherits Rectangle {
+    in property <string> glyph;
+    in property <string> tooltip-text: "";
+    in property <bool> danger: false;
+    in property <bool> enabled: true;
+
+    callback clicked;
+
+    width: 46px;
+    // 标题栏固定 32px，按钮同高填满（组件根元素不能引用 parent）
+    height: 32px;
+    border-radius: 5px;
+    clip: true;
+
+    // 交互态 = 启用且悬停/按下
+    private property <bool> active: root.enabled && (i-touch.has-hover || i-touch.pressed);
+
+    background: root.active
+        ? (root.danger
+            ? (i-touch.pressed
+                ? @linear-gradient(180deg, #8E0005 0%, #C13C46 55%, #E81123 100%)
+                : @linear-gradient(180deg, #E81123 0%, #F26C74 55%, #F7A0A6 100%))
+            : (i-touch.pressed
+                ? @linear-gradient(180deg, #5C9EC2 0%, #79BEE3 55%, #A6D9F2 100%)
+                : @linear-gradient(180deg, #FFFFFF 0%, #D9F1FD 55%, #9AD7F4 100%)))
+        : (root.enabled
+            ? @linear-gradient(180deg, #FFFFFF55 0%, #FFFFFF20 100%)
+            : transparent);
+
+    // 上缘高光带（光泽面）：禁用时隐藏
+    Rectangle {
+        x: 1px;
+        y: 1px;
+        width: parent.width - 2px;
+        height: 15px;
+        background: @linear-gradient(180deg, #FFFFFFE0 0%, #FFFFFF30 100%);
+        opacity: root.enabled ? 1.0 : 0.0;
+    }
+
+    Text {
+        text: root.glyph;
+        font-family: "Segoe MDL2 Assets";
+        font-size: 14px;
+        color: root.danger && root.active ? #FFFFFF : (root.enabled ? #1D4E66 : #9DB6C7);
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    i-touch := TouchArea {
+        width: parent.width;
+        height: parent.height;
+        // 保持可悬停以便工具提示仍能出现；点击由 root.enabled 把关
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { if (root.enabled) { root.clicked(); } }
+    }
+
+    // Tooltip 必须排在 i-touch 之后（更上层），TooltipArea 才能收到鼠标事件
+    if (root.tooltip-text != "") : Tooltip {
+        Rectangle {
+            background: FluentPalette.alternate-background;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: FluentPalette.border;
+            VerticalLayout {
+                padding-left: 9px;
+                padding-right: 9px;
+                padding-top: 6px;
+                padding-bottom: 6px;
+                Text {
+                    text: root.tooltip-text;
+                    font-size: 12px;
+                    color: FluentPalette.foreground;
+                }
+            }
+        }
+    }
+}
+
+export component AeroTitleBar inherits Rectangle {
+    in property <string> window-title;
+    in property <string> tooltip-minimize: "最小化";
+    in property <string> tooltip-maximize: "最大化";
+    in property <string> tooltip-close: "关闭";
+
+    callback drag-pressed();
+    callback minimize();
+    callback close();
+
+    // 宽度由实例化处绑定（组件根元素无法引用 parent；在 main/dialog 里写 width: parent.width）
+    height: 32px;
+
+    // 玻璃条底色：顶部更深的天蓝，底部与窗口主体的天空渐变衔接（主体 0% 即 #8ED1F0）
+    background: @linear-gradient(180deg, #74C1EC 0%, #8ED1F0 100%);
+
+    // 顶部高光带（玻璃反光）：白色从上往下淡出
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: 13px;
+        background: @linear-gradient(180deg, #FFFFFFC4 0%, #FFFFFF38 100%);
+    }
+
+    // 拖拽层：整条标题栏（按钮之外的区域按下即拖）。窗口固定大小，无双击最大化。
+    drag := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        mouse-cursor: pointer;
+        pointer-event(event) => { if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) { root.drag-pressed(); } }
+    }
+
+    // 标题文字
+    Text {
+        x: 12px;
+        y: 0;
+        height: parent.height;
+        vertical-alignment: center;
+        text: root.window-title;
+        font-size: 12px;
+        font-weight: 600;
+        color: #123A4E;
+    }
+
+    // 最小化
+    min-btn := CaptionButton {
+        glyph: "\u{e921}";
+        tooltip-text: root.tooltip-minimize;
+        x: parent.width - 138px;
+        y: 0;
+        clicked => { root.minimize(); }
+    }
+    // 最大化（窗口固定尺寸，永久禁用：只展示图标，可悬停看工具提示）
+    max-btn := CaptionButton {
+        glyph: "\u{e922}";
+        tooltip-text: root.tooltip-maximize;
+        enabled: false;
+        x: parent.width - 92px;
+        y: 0;
+    }
+    // 关闭
+    close-btn := CaptionButton {
+        glyph: "\u{e8bb}";
+        tooltip-text: root.tooltip-close;
+        danger: true;
+        x: parent.width - 46px;
+        y: 0;
+        clicked => { root.close(); }
+    }
+}

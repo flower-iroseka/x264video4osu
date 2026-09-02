@@ -11,7 +11,10 @@ use crate::services::args::{build, EncodeInput};
 use crate::services::ffmpeg::{cleanup_temp_files_public, Event, FfmpegService};
 use crate::services::format::OutputFormat;
 use crate::services::pathutil::{full_path, validate_path};
+use crate::services::settings::{self, AppSettings};
 use slint::{ComponentHandle, SharedString, Timer, TimerMode, VecModel};
+use slint::winit_030::WinitWindowAccessor;
+use slint::winit_030::winit::platform::windows::WindowExtWindows;
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
@@ -29,6 +32,37 @@ const TITLE_ERROR: &str = "Error";
 // ---------- 项目链接（对应旧程序 AppConfig；GitHubIssuesUrl 在旧程序中未被使用） ----------
 const REPO_URL: &str = "https://github.com/flower-iroseka/x264video4osu";
 
+/// 给 no-frame 对话框接好标题栏回调（拖拽 / 最小化 / 最大化还原 / 关闭=隐藏）。
+/// 主窗口的关闭还需清理编码进程，故在 initialize 中单独接线，不用本宏。
+/// 依赖 slint 的 `unstable-winit-030` 特性：经 WinitWindowAccessor 拿到底层
+/// winit 窗口，drag_window 走原生 HTCAPTION 拖拽（保留 Aero snap）。
+macro_rules! wire_title_bar {
+    ($comp:expr) => {{
+        // ComponentHandle::window() 返回借用（&Window），不能跨 'static 闭包持有；
+        // 捕获组件 Weak，回调里 upgrade 后取 window() 的局部借用。
+        use slint::winit_030::WinitWindowAccessor;
+        let weak = $comp.as_weak();
+        $comp.on_title_bar_drag(move || {
+            if let Some(c) = weak.upgrade() {
+                let _ = c.window().with_winit_window(|w| w.drag_window());
+            }
+        });
+        let weak = $comp.as_weak();
+        $comp.on_title_bar_minimize(move || {
+            if let Some(c) = weak.upgrade() {
+                let _ = c.window().with_winit_window(|w| w.set_minimized(true));
+            }
+        });
+        let weak = $comp.as_weak();
+        $comp.on_title_bar_close(move || {
+            if let Some(c) = weak.upgrade() {
+                let _ = c.window().hide();
+            }
+        });
+    }};
+}
+pub(crate) use wire_title_bar;
+
 pub struct AppController {
     ui: crate::MainWindow,
     service: FfmpegService,
@@ -41,6 +75,8 @@ pub struct AppController {
     current_log_file_name: Option<String>,
     /// 0 = CRF，1 = 2pass（与旧程序 `TwoPassRadio.IsChecked` 对应）
     mode_index: i32,
+    /// 持久化设置（主题/语言）；主题切换与语言切换时同步回写
+    settings: AppSettings,
     /// 轮询编码事件的中断器（必须持有，否则会停止触发）
     poll_timer: Timer,
     /// 自动滚动去抖标志
@@ -59,16 +95,21 @@ impl AppController {
         let ui = crate::MainWindow::new().expect("failed to create main window");
         let (service, rx) = FfmpegService::new();
 
+        // 读取持久化设置：首次运行（无设置文件）回落默认值（中文 + 默认主题）
+        let settings = settings::load();
+        let lang = if settings.lang_index == 0 { Lang::Zh } else { Lang::En };
+
         let controller = Rc::new(RefCell::new(Self {
             ui,
             service,
             rx,
-            strings: i18n::for_lang(i18n::default_lang()),
+            strings: i18n::for_lang(lang),
             log_buffer: String::new(),
             log_lines_model: Rc::new(VecModel::default()),
             last_output_path: None,
             current_log_file_name: None,
             mode_index: 0,
+            settings,
             poll_timer: Timer::default(),
             scroll_pending: Rc::new(Cell::new(false)),
         }));
@@ -84,7 +125,10 @@ impl AppController {
         let rc = self_rc.borrow();
         let ui = &rc.ui;
 
-        // 默认语言（zh-CN，与旧程序一致）
+        // 应用保存的语言与主题（首次运行回落默认：中文 + 默认主题）。语言框索引
+        // 通过 <=> 双向绑定，这里只同步界面文本；主题通过 apply-theme 同步全局换肤。
+        ui.set_language_index(rc.settings.lang_index);
+        ui.invoke_apply_theme(rc.settings.theme_index);
         ui.set_strings(rc.strings.ui.clone());
 
         // ---- 按钮回调 ----
@@ -131,11 +175,45 @@ impl AppController {
             }
         });
 
+        // ---- 无边框标题栏（no-frame）----
+        // window() 返回借用（&Window），不能跨 'static 闭包持有；用组件 Weak 在
+        // 回调里 upgrade 后取局部借用。
+        let weak_ui = ui.as_weak();
+        ui.on_title_bar_drag(move || {
+            if let Some(c) = weak_ui.upgrade() {
+                let _ = c.window().with_winit_window(|w| w.drag_window());
+            }
+        });
+        let weak_ui = ui.as_weak();
+        ui.on_title_bar_minimize(move || {
+            if let Some(c) = weak_ui.upgrade() {
+                let _ = c.window().with_winit_window(|w| w.set_minimized(true));
+            }
+        });
+        // 关闭按钮与原生 X 等价：先清理编码进程，再隐藏窗口（隐藏触发 keepalive 释放，事件循环退出）
+        let w = weak.clone();
+        let weak_ui = ui.as_weak();
+        ui.on_title_bar_close(move || {
+            if let Some(c) = w.upgrade() {
+                c.borrow_mut().cleanup_for_close();
+            }
+            if let Some(c) = weak_ui.upgrade() {
+                let _ = c.window().hide();
+            }
+        });
         // ---- 语言切换 ----
         let w = weak.clone();
         ui.on_language_changed(move |index: i32| {
             if let Some(c) = w.upgrade() {
                 c.borrow_mut().handle_language_changed(index);
+            }
+        });
+
+        // ---- 主题切换 ----
+        let w = weak.clone();
+        ui.on_theme_changed(move |index: i32| {
+            if let Some(c) = w.upgrade() {
+                c.borrow_mut().handle_theme_changed(index);
             }
         });
 
@@ -169,6 +247,7 @@ impl AppController {
         drop(rc);
 
         // ---- 轮询编码事件 ----
+        // 窗口固定尺寸（用户不可缩放、无最大化），无需再同步最大化状态。
         let w = weak.clone();
         let timer = Timer::default();
         timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
@@ -187,13 +266,14 @@ impl AppController {
         slint::Timer::single_shot(Duration::from_millis(100), move || {
             if let Some(c) = w.upgrade() {
                 const WINDOW_W: f32 = 572.0; // 与 ui/main.slint 的 Window width 保持一致
-                const WINDOW_H: f32 = 545.0; // 与 ui/main.slint 的 Window height 保持一致
                 let c = c.borrow();
+                // 与 ui/main.slint 的 Window height 保持一致：Aero 577（内容 545 + 标题栏 32），默认主题 545
+                let window_h = if c.settings.theme().is_aero() { 577.0 } else { 545.0 };
                 let win = c.ui.window();
                 let sf = win.scale_factor() as f64;
                 let desired = slint::PhysicalSize::new(
                     (WINDOW_W as f64 * sf) as u32,
-                    (WINDOW_H as f64 * sf) as u32,
+                    (window_h as f64 * sf) as u32,
                 );
                 // 仅当物理尺寸与目标不一致时才重设，避免在缩放因子尚未
                 // 稳定时把已正确的窗口改小。
@@ -328,22 +408,93 @@ impl AppController {
 
     fn handle_show_about(&mut self) {
         let dialog = crate::AboutDialog::new().expect("failed to create about dialog");
+        wire_title_bar!(dialog);
+        // 对话框单独持有自己的 FluentPalette 实例，需各自应用当前主题
+        dialog.invoke_apply_theme(self.settings.theme_index);
         dialog.set_dialog_title(self.strings.about_title.clone().into());
         dialog.set_version_line(self.strings.about_version_line.clone().into());
         dialog.set_description(self.strings.about_description.clone().into());
         dialog.set_repository_text(self.strings.repository_text.clone().into());
         dialog.set_close_text(self.strings.close_text.clone().into());
+        dialog.set_titlebar_tooltip_minimize(self.strings.titlebar_minimize.clone().into());
+        dialog.set_titlebar_tooltip_maximize(self.strings.titlebar_maximize.clone().into());
+        dialog.set_titlebar_tooltip_close(self.strings.titlebar_close.clone().into());
 
         let url_repo = REPO_URL.to_string();
         dialog.on_open_repository(move || {
             let _ = crate::io::external::open_url(&url_repo);
         });
+
+        // ---- 模态化：禁用主窗口（无法对焦/操作），对话框任意关闭路径恢复 ----
+        // 若不禁用，关于窗口打开时关掉主窗口只会隐藏主窗口，事件循环因对话框
+        // 仍可见而继续运行，整个程序退不出去。winit 的 set_enable 封装了
+        // EnableWindow：被禁用的窗口无法激活、无法接收输入，正是「主窗口无法
+        // 对焦或者操作」。注意 show_message 不模态（编码中可能弹错，不能挡住
+        // 「停止」按钮），故这里只针对关于窗口。
+        {
+            let main = self.ui.window();
+            let _ = main.with_winit_window(|w| w.set_enable(false));
+        }
+        let main_weak = self.ui.as_weak();
+        let reenable_main = move || {
+            if let Some(m) = main_weak.upgrade() {
+                let _ = m.window().with_winit_window(|w| w.set_enable(true));
+            }
+        };
+
+        // ---- 闪烁反馈：检测「点击被禁用的主窗口」----
+        // 主窗口禁用后应用层收不到它的鼠标消息（EnableWindow 直接拦截），OS 自带的
+        // 「闪烁 owned 对话框标题栏」反馈又只作用于原生 caption（no-frame 无），因此
+        // 装 WH_MOUSE_LL 低级鼠标钩子在输入层捕获「按下点命中主窗口」，命中即触发
+        // 关于窗口标题栏/边框闪烁（见 win_flash 模块）。三条关闭路径都要 about_closed。
+        {
+            let main_hwnd = self
+                .ui
+                .window()
+                .with_winit_window(|w| {
+                    use slint::winit_030::winit::raw_window_handle::HasWindowHandle;
+                    match w.window_handle() {
+                        Ok(h) => match h.as_raw() {
+                            slint::winit_030::winit::raw_window_handle::RawWindowHandle::Win32(
+                                win32,
+                            ) => win32.hwnd.get() as *mut core::ffi::c_void,
+                            _ => std::ptr::null_mut(),
+                        },
+                        Err(_) => std::ptr::null_mut(),
+                    }
+                })
+                .unwrap_or(std::ptr::null_mut());
+            crate::win_flash::about_opened(main_hwnd, &dialog);
+        }
+
+        // 「关闭」按钮
         let weak = dialog.as_weak();
+        let r = reenable_main.clone();
         dialog.on_close_dialog(move || {
+            crate::win_flash::about_closed();
+            r();
             if let Some(d) = weak.upgrade() {
                 let _ = d.window().hide();
             }
         });
+        // 标题栏 X（覆盖 wire_title_bar 默认 close：先恢复主窗口再隐藏）
+        let weak = dialog.as_weak();
+        let r = reenable_main.clone();
+        dialog.on_title_bar_close(move || {
+            crate::win_flash::about_closed();
+            r();
+            if let Some(d) = weak.upgrade() {
+                let _ = d.window().hide();
+            }
+        });
+        // 系统关闭（ALT+F4 / 任务栏关闭）
+        let r = reenable_main.clone();
+        dialog.window().on_close_requested(move || {
+            crate::win_flash::about_closed();
+            r();
+            slint::CloseRequestResponse::HideWindow
+        });
+
         let _ = dialog.window().show();
     }
 
@@ -351,6 +502,16 @@ impl AppController {
         let lang = if index == 0 { Lang::Zh } else { Lang::En };
         self.strings = i18n::for_lang(lang);
         self.ui.set_strings(self.strings.ui.clone());
+        // 持久化语言选择（语言框索引已通过 <=> 同步到 UI，这里只需保存）
+        self.settings.lang_index = index;
+        settings::save(&self.settings);
+    }
+
+    fn handle_theme_changed(&mut self, index: i32) {
+        // 同步全局换肤（is-aero），并持久化主题选择
+        self.ui.invoke_apply_theme(index);
+        self.settings.theme_index = index;
+        settings::save(&self.settings);
     }
 
     fn handle_mode_changed(&mut self, text: String) {
@@ -525,9 +686,15 @@ impl AppController {
 
     fn show_message(&mut self, title: &str, msg: &str) {
         let dialog = crate::MessageDialog::new().expect("failed to create message dialog");
+        wire_title_bar!(dialog);
+        // 对话框单独持有自己的 FluentPalette 实例，需各自应用当前主题
+        dialog.invoke_apply_theme(self.settings.theme_index);
         dialog.set_dialog_title(title.into());
         dialog.set_message(msg.into());
         dialog.set_ok_text(self.strings.ok_text.clone().into());
+        dialog.set_titlebar_tooltip_minimize(self.strings.titlebar_minimize.clone().into());
+        dialog.set_titlebar_tooltip_maximize(self.strings.titlebar_maximize.clone().into());
+        dialog.set_titlebar_tooltip_close(self.strings.titlebar_close.clone().into());
         let weak = dialog.as_weak();
         dialog.on_ok(move || {
             if let Some(d) = weak.upgrade() {

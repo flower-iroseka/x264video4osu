@@ -1,40 +1,82 @@
-import { Button, VerticalBox, HorizontalBox } from "std-widgets.slint";
+import { Button, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
+import { AeroTitleBar } from "../aero-title-bar.slint";
+import { FluentPalette } from "styling.slint";
 
 export component FfmpegNotFoundDialog inherits Window {
     title: root.dialog-title;
+    // 主题：theme-index 0 = 默认主题（系统原生标题栏），1 = Aero（自绘玻璃标题栏）
+    no-frame: root.theme-index == 1;
     width: 460px;
-    height: 220px;
-    background: #F9FAFB;
+    height: root.theme-index == 1 ? 252px : 220px;
+    background: Palette.background;
 
+    in-out property <int> theme-index: 0;
     in property <string> dialog-title;
     in property <string> message;
     in property <string> download-text;
     in property <string> exit-text;
 
+    in property <string> titlebar-tooltip-minimize;
+    in property <string> titlebar-tooltip-maximize;
+    in property <string> titlebar-tooltip-close;
+
     callback download();
     callback exit-dialog();
+    callback title-bar-drag();
+    callback title-bar-minimize();
+    callback title-bar-close();
 
-    VerticalBox {
-        padding: 20px;
-        spacing: 16px;
+    // 把主题索引写入 FluentPalette 全局（驱动所有控件换肤）。FluentPalette 来自
+    // 导入文件，不生成 Rust 访问器，只能靠这个 public 函数从 Rust 端 invoke 同步设置。
+    public function apply-theme(t: int) {
+        FluentPalette.is-aero = t == 1;
+        root.theme-index = t;
+    }
 
-        Text {
-            text: root.message;
-            wrap: word-wrap;
+    base := Rectangle {
+        width: parent.width;
+        height: parent.height;
+
+        // ---- Frutiger Aero 标题栏（仅 Aero 主题） ----
+        if root.theme-index == 1 : AeroTitleBar {
+            window-title: root.dialog-title;
+            tooltip-minimize: root.titlebar-tooltip-minimize;
+            tooltip-maximize: root.titlebar-tooltip-maximize;
+            tooltip-close: root.titlebar-tooltip-close;
+            width: parent.width;
+            y: 0;
+            drag-pressed => { root.title-bar-drag(); }
+            minimize => { root.title-bar-minimize(); }
+            close => { root.title-bar-close(); }
         }
-        Rectangle { height: 0px; vertical-stretch: 1; }
-        HorizontalBox {
-            alignment: end;
-            spacing: 12px;
-            Button {
-                text: root.download-text;
-                width: 130px;
-                clicked => { root.download(); }
+
+        VerticalBox {
+            y: root.theme-index == 1 ? 32px : 0px;
+            width: parent.width;
+            height: parent.height - (root.theme-index == 1 ? 32px : 0px);
+            padding: 20px;
+            spacing: 16px;
+
+            Text {
+                text: root.message;
+                wrap: word-wrap;
             }
-            Button {
-                text: root.exit-text;
-                width: 130px;
-                clicked => { root.exit-dialog(); }
+            Rectangle { height: 0px; vertical-stretch: 1; }
+            HorizontalBox {
+                alignment: end;
+                spacing: 12px;
+                Button {
+                    text: root.download-text;
+                    width: 130px;
+                    tooltip-text: root.download-text;
+                    clicked => { root.download(); }
+                }
+                Button {
+                    text: root.exit-text;
+                    width: 130px;
+                    tooltip-text: root.exit-text;
+                    clicked => { root.exit-dialog(); }
+                }
             }
         }
     }

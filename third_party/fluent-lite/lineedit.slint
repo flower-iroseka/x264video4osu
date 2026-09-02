@@ -21,6 +21,7 @@ export component LineEdit {
     callback edited <=> base.edited;
     callback key-pressed <=> base.key-pressed;
     callback key-released <=> base.key-released;
+    in property <string> tooltip-text: "";
 
     public function set-selection-offsets(start: int, end: int) {
         base.set-selection-offsets(start, end);
@@ -118,6 +119,27 @@ export component LineEdit {
             width: parent.width - 2 * parent.border-radius;
             height: 2px;
             border-radius: 1px;
+        }
+    }
+
+    // Tooltip 必须排在 base（含触摸区）之后，TooltipArea 才能收到鼠标事件
+    if (root.tooltip-text != ""): Tooltip {
+        Rectangle {
+            background: FluentPalette.alternate-background;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: FluentPalette.border;
+            VerticalLayout {
+                padding-left: 9px;
+                padding-right: 9px;
+                padding-top: 6px;
+                padding-bottom: 6px;
+                Text {
+                    text: root.tooltip-text;
+                    font-size: 12px;
+                    color: FluentPalette.foreground;
+                }
+            }
         }
     }
 }

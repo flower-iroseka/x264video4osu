@@ -12,6 +12,7 @@ export component Button {
     in property <bool> enabled <=> i-touch-area.enabled;
     in property <bool> checkable;
     in property <bool> colorize-icon;
+    in property <string> tooltip-text: "";
     out property <bool> has-focus: i-focus-scope.has-focus;
     out property <bool> pressed: self.enabled && i-touch-area.pressed;
     in-out property <bool> checked;
@@ -19,6 +20,14 @@ export component Button {
     callback clicked;
 
     private property <brush> text-color: primary || checked ? FluentPalette.accent-foreground : FluentPalette.control-foreground;
+
+    // XP/Vista 光泽按钮：竖直流光渐变（上亮下暗）+ 上缘白色高光带
+    private property <brush> gloss-base: @linear-gradient(180deg, #FFFFFF 0%, #D6EDFB 48%, #A9D8F2 100%);
+    private property <brush> gloss-hover: @linear-gradient(180deg, #FFFFFF 0%, #E6F7FF 48%, #C3E9FB 100%);
+    private property <brush> gloss-pressed: @linear-gradient(180deg, #A8D4EE 0%, #C2E7FA 48%, #EAF9FF 100%);
+    private property <brush> gloss-primary: @linear-gradient(180deg, #3FC0F5 0%, #00A8E8 48%, #0088C2 100%);
+    private property <brush> gloss-primary-hover: @linear-gradient(180deg, #6BD2FA 0%, #22B4EE 48%, #0097D4 100%);
+    private property <brush> gloss-primary-pressed: @linear-gradient(180deg, #007DB6 0%, #009AD4 48%, #2FBCF1 100%);
 
     min-width: max(32px, i-layout.min-width);
     min-height: max(32px, i-layout.min-height);
@@ -40,15 +49,15 @@ export component Button {
             root.text-color: root.primary || root.checked ? FluentPalette.text-accent-foreground-disabled : FluentPalette.text-disabled;
         }
         pressed when root.pressed : {
-            i-background.background: root.primary || root.checked ? FluentPalette.tertiary-accent-background : FluentPalette.control-tertiary;
+            i-background.background: root.primary || root.checked ? (FluentPalette.is-aero ? gloss-primary-pressed : FluentPalette.tertiary-accent-background) : (FluentPalette.is-aero ? gloss-pressed : FluentPalette.control-tertiary);
             i-border.border-color: FluentPalette.border;
             root.text-color: root.primary || root.checked ? FluentPalette.text-accent-foreground-secondary : FluentPalette.text-secondary;
         }
         hover when i-touch-area.has-hover : {
-            i-background.background: root.primary || root.checked ? FluentPalette.secondary-accent-background : FluentPalette.control-secondary;
+            i-background.background: root.primary || root.checked ? (FluentPalette.is-aero ? gloss-primary-hover : FluentPalette.secondary-accent-background) : (FluentPalette.is-aero ? gloss-hover : FluentPalette.control-secondary);
         }
         checked when root.checked : {
-            i-background.background: FluentPalette.accent-background;
+            i-background.background: FluentPalette.is-aero ? gloss-primary : FluentPalette.accent-background;
             i-border.border-color: FluentPalette.accent-control-border;
             root.text-color: FluentPalette.accent-foreground;
         }
@@ -56,9 +65,22 @@ export component Button {
 
     i-background := Rectangle {
         border-radius: 4px;
-        background: root.primary ? FluentPalette.accent-background : FluentPalette.control-background;
+        background: root.primary ? (FluentPalette.is-aero ? gloss-primary : FluentPalette.accent-background) : (FluentPalette.is-aero ? gloss-base : FluentPalette.control-background);
+        clip: true;
 
         animate background, border-color { duration: 150ms; }
+
+        // 上缘高光带（光泽面）：仅 Aero 主题显示；按下时压暗，模拟 XP 按钮的被按下状态
+        Rectangle {
+            visible: FluentPalette.is-aero;
+            x: 1px;
+            y: 1px;
+            width: parent.width - 2px;
+            height: 46%;
+            background: @linear-gradient(180deg, #FFFFFFD9 0%, #FFFFFF2E 100%);
+            opacity: root.pressed ? 0.35 : 0.9;
+            animate opacity { duration: 150ms; }
+        }
 
         i-border := Rectangle {
             border-radius: parent.border-radius;
@@ -95,11 +117,23 @@ export component Button {
 
     i-touch-area := TouchArea {
         clicked => {
+            // 点击按钮时把焦点让给不可见目标，使正在编辑的文本框失焦。
+            // 保留「按钮不抢占焦点」的设计：目标宽度 0、自身不显示焦点边框。
+            i-focus-blank.focus();
             if (root.checkable) {
                 root.checked = !root.checked;
             }
             root.clicked();
         }
+    }
+
+    // 不可见焦点清除目标：宽度 0、不参与点击与 Tab 遍历，仅作 `focus()` 接收端
+    i-focus-blank := FocusScope {
+        x: 0;
+        width: 0;
+        height: 0;
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
     }
 
     i-focus-scope := FocusScope {
@@ -120,5 +154,26 @@ export component Button {
     // focus border
     if (root.has-focus && root.enabled) : FocusBorder {
         border-radius: i-background.border-radius;
+    }
+
+    // Tooltip 必须排在 TouchArea 之后（更上层），TooltipArea 才能收到鼠标事件
+    if (root.tooltip-text != ""): Tooltip {
+        Rectangle {
+            background: FluentPalette.alternate-background;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: FluentPalette.border;
+            VerticalLayout {
+                padding-left: 9px;
+                padding-right: 9px;
+                padding-top: 6px;
+                padding-bottom: 6px;
+                Text {
+                    text: root.tooltip-text;
+                    font-size: 12px;
+                    color: FluentPalette.foreground;
+                }
+            }
+        }
     }
 }

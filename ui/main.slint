@@ -1,4 +1,6 @@
-import { Button, LineEdit, ComboBox, CheckBox, TabWidget, RadioGroup, ListView, HorizontalBox, VerticalBox } from "std-widgets.slint";
+import { Button, LineEdit, ComboBox, CheckBox, TabWidget, RadioGroup, ListView, HorizontalBox, VerticalBox, Palette } from "std-widgets.slint";
+import { AeroTitleBar } from "aero-title-bar.slint";
+import { FluentPalette } from "styling.slint";
 
 // 全部 UI 文本（随语言切换由 Rust 端一次性更新）
 export struct UiStrings {
@@ -21,6 +23,34 @@ export struct UiStrings {
     button-save-log: string,
     button-about: string,
     button-open-folder: string,
+    // ---- 主题下拉框 ----
+    theme-default: string,
+    theme-aero: string,
+    // ---- 悬停工具提示（含标题栏按钮） ----
+    tip-theme: string,
+    tip-browse-input: string,
+    tip-browse-output: string,
+    tip-start: string,
+    tip-stop: string,
+    tip-about: string,
+    tip-open-folder: string,
+    tip-save-log: string,
+    tip-format: string,
+    tip-language: string,
+    tip-scale-up: string,
+    tip-extract-audio: string,
+    tip-auto-scroll: string,
+    tip-titlebar-minimize: string,
+    tip-titlebar-maximize: string,
+    tip-titlebar-close: string,
+    // 文本框 / 单选框 / 标签
+    tip-input-path: string,
+    tip-output-path: string,
+    tip-value: string,
+    tip-width: string,
+    tip-height: string,
+    tip-method: string,
+    tip-resolution: string,
 }
 
 // 日志面板。滚动由 Rust 端驱动：启用自动滚动时在追加日志后把
@@ -120,10 +150,21 @@ component FormatTip inherits Rectangle {
     property <length> popup-x: 0px;
     property <length> popup-y: 0px;
 
+    // 不可见焦点清除目标：宽度 0、不参与点击与 Tab 遍历，仅作 `focus()` 接收端，
+    // 让正在编辑的文本框在点击此控件时失焦（与其它可点击控件保持一致）。
+    focus-blank := FocusScope {
+        x: 0;
+        width: 0;
+        height: 0;
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+    }
+
     // 按钮交互：悬停仅驱动亮起（has-hover）；点击切换气泡显示
     touch := TouchArea {
         mouse-cursor: pointer;
         clicked => {
+            focus-blank.focus();
             if tip.is-open {
                 tip.close();
             } else {
@@ -172,11 +213,78 @@ component FormatTip inherits Rectangle {
     }
 }
 
+// 带悬停工具提示的字段标签。提示触发区 = 标签文字本身；Tooltip 必须排在
+// 组件的其它指针目标之后（这里就是最后一个子元素），TooltipArea 才能收到鼠标事件。
+component TippableLabel inherits Text {
+    in property <string> tip: "";
+
+    if (root.tip != ""): Tooltip {
+        Rectangle {
+            background: Palette.alternate-background;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: Palette.border;
+            VerticalLayout {
+                padding-left: 9px;
+                padding-right: 9px;
+                padding-top: 6px;
+                padding-bottom: 6px;
+                Text { text: root.tip; font-size: 12px; color: Palette.foreground; }
+            }
+        }
+    }
+}
+
+// 编码方法单选行。RadioButton 是编译器内建伪元素，类型检查不允许自定义属性
+// （tooltip-text 会在 lowering 前报 Unknown property），单选项 tooltip 不可行；
+// 故把整行（RadioGroup）作为提示触发区：Tooltip 排在 RadioGroup 之后即最上层，
+// 悬停任一选项都能看到同一说明，点击仍正常透传。
+component MethodRadioRow {
+    in property <string> tip;
+    callback selected(string);
+
+    // 隐式根是裸 Rectangle：preferred=0 / stretch=1，放在布局里会被撑满整行，
+    // RadioGroup 内部的 GridLayout 把两个单选按钮居中到窗口中间。显式把根尺寸
+    // 绑到 RadioGroup 的内容尺寸（min-width/min-height），保持紧凑靠左。
+    width: rg.min-width;
+    height: rg.min-height;
+
+    rg := RadioGroup {
+        orientation: horizontal;
+        selected(text) => { root.selected(text); }
+        RadioButton { text: "CRF"; checked: true; }
+        RadioButton { text: "2pass"; }
+    }
+
+    if (root.tip != ""): Tooltip {
+        Rectangle {
+            background: Palette.alternate-background;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: Palette.border;
+            VerticalLayout {
+                padding-left: 9px;
+                padding-right: 9px;
+                padding-top: 6px;
+                padding-bottom: 6px;
+                Text { text: root.tip; font-size: 12px; color: Palette.foreground; }
+            }
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     title: "x264video4osu";
+    // 主题：theme-index 0 = 默认主题（老主题，系统原生标题栏），1 = Aero（自绘玻璃标题栏）。
+    // 老主题下窗口无 no-frame（原生标题栏），内容区从 y=0 开始；Aero 下 no-frame + 自绘标题栏，
+    // 总高 577px = 内容区 545px + 标题栏 32px。WINDOW_H 常量在 app.rs 同步。
+    no-frame: root.theme-index == 1;
     width: 572px;
-    height: 545px;
+    height: root.theme-index == 1 ? 577px : 545px;
+    // Aero：窗口底色为天蓝→白的天空渐变；默认主题：#FFFFFF 纯白（WPF 默认窗口底色，来自 FluentPalette.background）
+    background: Palette.background;
 
+    in-out property <int> theme-index: 0;
     in property <UiStrings> strings;
 
     // ---------- 输入数据 ----------
@@ -219,16 +327,64 @@ export component MainWindow inherits Window {
     callback save-log();
     callback show-about();
     callback language-changed(int);
+    callback theme-changed(int);
     callback format-changed(int);
     callback mode-changed(string);
     callback scroll-log-to-end();
 
+    // ---------- 无边框标题栏 ----------
+    callback title-bar-drag();
+    callback title-bar-minimize();
+    callback title-bar-close();
+
+    // 把主题索引写入 FluentPalette 全局（驱动所有控件换肤）。FluentPalette 来自
+    // 导入文件，不生成 Rust 访问器，只能靠这个 public 函数从 Rust 端 invoke 同步设置。
+    public function apply-theme(t: int) {
+        FluentPalette.is-aero = t == 1;
+        root.theme-index = t;
+    }
+
     // 转发给日志组件，供 Rust 端在自动滚动时调用
     scroll-log-to-end => { log-view.scroll-to-end(); }
 
-    VerticalBox {
-        padding: 6px;
-        spacing: 4px;
+    // 根容器：普通 Rectangle（非布局），子元素用绝对坐标摆放——
+    // 顶部 AeroTitleBar，下方主体 VerticalBox。
+    base := Rectangle {
+        width: parent.width;
+        height: parent.height;
+
+        // ---- 全局背景 FocusScope ----
+        // Slint 默认点击空白区域不会清除焦点（只有点其它文本框才会切换焦点）。
+        // 在窗口最底层放一个铺满窗口的 FocusScope，点击非交互区域（空白、标签、
+        // 面板背景等）时它自动夺取焦点，让正在编辑的文本框失焦。
+        // 必须是最底层（第一个子元素）：其它控件先拿到点击时它不参与，不干扰交互。
+        // focus-on-tab-navigation 关掉，避免在 Tab 焦点链里多出一个不可见停靠点。
+        bg-focus := FocusScope {
+            width: parent.width;
+            height: parent.height;
+            focus-on-tab-navigation: false;
+        }
+
+        // ---- Frutiger Aero 标题栏（仅 Aero 主题；老主题用系统原生标题栏） ----
+        if root.theme-index == 1 : AeroTitleBar {
+            window-title: "x264video4osu";
+            tooltip-minimize: root.strings.tip-titlebar-minimize;
+            tooltip-maximize: root.strings.tip-titlebar-maximize;
+            tooltip-close: root.strings.tip-titlebar-close;
+            width: parent.width;
+            y: 0;
+            drag-pressed => { root.title-bar-drag(); }
+            minimize => { root.title-bar-minimize(); }
+            close => { root.title-bar-close(); }
+        }
+
+        // ---- 主体内容（Aero：标题栏下方；默认主题：从 y=0 全高） ----
+        VerticalBox {
+            y: root.theme-index == 1 ? 32px : 0px;
+            width: parent.width;
+            height: parent.height - (root.theme-index == 1 ? 32px : 0px);
+            padding: 6px;
+            spacing: 4px;
 
         TabWidget {
             horizontal-stretch: 1;
@@ -236,9 +392,11 @@ export component MainWindow inherits Window {
 
             Tab { title: strings.tab-video;
                 Rectangle {
-                    background: #F8F9FA;
+                    background: Palette.alternate-background;
                     border-width: 1px;
-                    border-color: #E0E0E0;
+                    // 默认主题：页面内边框为 WPF 原版的极浅 1px 细线 #E0E0E0（而非 palette 的深灰）；
+                    // Aero 主题沿用 palette 的 aqua 边框 #6BB7D9
+                    border-color: FluentPalette.is-aero ? Palette.border : #E0E0E0;
                     border-radius: 4px;
                     VerticalBox {
                         padding: 6px;
@@ -249,18 +407,18 @@ export component MainWindow inherits Window {
                             vertical-stretch: 0;
                             height: 40px;
                             spacing: 4px;
-                            Text { text: strings.label-input; width: 90px; vertical-alignment: center; }
-                            LineEdit { horizontal-stretch: 1; min-width: 240px; text <=> root.input-path; }
-                            Button { text: strings.button-browse; width: 50px; clicked => { root.browse-input(); } }
+                            TippableLabel { text: strings.label-input; tip: strings.tip-input-path; width: 90px; vertical-alignment: center; }
+                            LineEdit { horizontal-stretch: 1; min-width: 240px; text <=> root.input-path; tooltip-text: strings.tip-input-path; }
+                            Button { text: strings.button-browse; width: 50px; tooltip-text: strings.tip-browse-input; clicked => { root.browse-input(); } }
                         }
 
                         // ---- 输出文件 ----
                         HorizontalBox {
                             vertical-stretch: 0;
                             spacing: 4px;
-                            Text { text: strings.label-output; width: 90px; vertical-alignment: center; }
-                            LineEdit { horizontal-stretch: 1; min-width: 240px; text <=> root.output-path; }
-                            Button { text: strings.button-browse; width: 50px; clicked => { root.browse-output(); } }
+                            TippableLabel { text: strings.label-output; tip: strings.tip-output-path; width: 90px; vertical-alignment: center; }
+                            LineEdit { horizontal-stretch: 1; min-width: 240px; text <=> root.output-path; tooltip-text: strings.tip-output-path; }
+                            Button { text: strings.button-browse; width: 50px; tooltip-text: strings.tip-browse-output; clicked => { root.browse-output(); } }
                         }
 
                         // ---- 分隔线 ----
@@ -270,8 +428,8 @@ export component MainWindow inherits Window {
                         HorizontalBox {
                             vertical-stretch: 0;
                             spacing: 4px;
-                            Text { text: strings.label-format; width: 90px; vertical-alignment: center; }
-                            ComboBox { width: 80px; model: ["flv", "avi", "mp4"]; current-index <=> root.format-index; selected => { root.format-changed(root.format-index); } }
+                            TippableLabel { text: strings.label-format; tip: strings.tip-format; width: 90px; vertical-alignment: center; }
+                            ComboBox { width: 80px; model: ["flv", "avi", "mp4"]; tooltip-text: strings.tip-format; current-index <=> root.format-index; selected => { root.format-changed(root.format-index); } }
                             FormatTip { tip-text: strings.format-tip; }
                         }
 
@@ -279,8 +437,8 @@ export component MainWindow inherits Window {
                         HorizontalBox {
                             vertical-stretch: 0;
                             spacing: 4px;
-                            Text { text: strings.label-method; width: 90px; vertical-alignment: center; }
-                            RadioGroup { orientation: horizontal; selected(text) => { root.mode-changed(text); } RadioButton { text: "CRF"; checked: true; } RadioButton { text: "2pass"; } }
+                            TippableLabel { text: strings.label-method; tip: strings.tip-method; width: 90px; vertical-alignment: center; }
+                            MethodRadioRow { tip: strings.tip-method; selected(text) => { root.mode-changed(text); } }
                         }
 
                         // ---- 数值框（2pass 码率 / CRF 质量） ----
@@ -288,7 +446,7 @@ export component MainWindow inherits Window {
                             vertical-stretch: 0;
                             spacing: 4px;
                             Text { width: 90px; }
-                            LineEdit { width: 80px; text <=> root.value-text; }
+                            LineEdit { width: 80px; text <=> root.value-text; tooltip-text: strings.tip-value; }
                         }
 
                         // ---- 分辨率 ----
@@ -300,17 +458,17 @@ export component MainWindow inherits Window {
                             vertical-stretch: 0;
                             // 与上面各行的 spacing:4px 一致，保证「宽度」跟输入框的起始列对齐
                             spacing: 4px;
-                            Text { text: strings.label-resolution; width: 90px; vertical-alignment: center; }
+                            TippableLabel { text: strings.label-resolution; tip: strings.tip-resolution; width: 90px; vertical-alignment: center; }
                             HorizontalLayout {
                                 spacing: 3px;
-                                Text { text: strings.label-width; vertical-alignment: center; }
-                                LineEdit { min-width: 70px; horizontal-stretch: 0; text <=> root.width-text; }
+                                TippableLabel { text: strings.label-width; tip: strings.tip-width; vertical-alignment: center; }
+                                LineEdit { min-width: 70px; horizontal-stretch: 0; text <=> root.width-text; tooltip-text: strings.tip-width; }
                             }
                             Rectangle { horizontal-stretch: 45; }
                             HorizontalLayout {
                                 spacing: 3px;
-                                Text { text: strings.label-height; vertical-alignment: center; }
-                                LineEdit { min-width: 70px; horizontal-stretch: 0; text <=> root.height-text; }
+                                TippableLabel { text: strings.label-height; tip: strings.tip-height; vertical-alignment: center; }
+                                LineEdit { min-width: 70px; horizontal-stretch: 0; text <=> root.height-text; tooltip-text: strings.tip-height; }
                             }
                             Rectangle { horizontal-stretch: 55; }
                         }
@@ -318,11 +476,11 @@ export component MainWindow inherits Window {
                         // ---- 复选项（左侧 10px 空白 margin） ----
                         HorizontalBox {
                             padding-left: 10px;
-                            CheckBox { horizontal-stretch: 1; vertical-stretch: 0; text: strings.check-scale-up; checked <=> root.scale-up; }
+                            CheckBox { horizontal-stretch: 1; vertical-stretch: 0; text: strings.check-scale-up; tooltip-text: strings.tip-scale-up; checked <=> root.scale-up; }
                         }
                         HorizontalBox {
                             padding-left: 10px;
-                            CheckBox { horizontal-stretch: 1; vertical-stretch: 0; text: strings.check-extract-audio; checked <=> root.extract-audio; }
+                            CheckBox { horizontal-stretch: 1; vertical-stretch: 0; text: strings.check-extract-audio; tooltip-text: strings.tip-extract-audio; checked <=> root.extract-audio; }
                         }
 
                         // ---- 弹性占位：吸收富余高度，让设置行保持紧凑不拉伸 ----
@@ -332,7 +490,7 @@ export component MainWindow inherits Window {
                         if (root.result-visible): HorizontalBox {
                             spacing: 8px;
                             Text { text: root.output-size-text; vertical-alignment: center; }
-                            Button { text: strings.button-open-folder; clicked => { root.open-folder(); } }
+                            Button { text: strings.button-open-folder; tooltip-text: strings.tip-open-folder; clicked => { root.open-folder(); } }
                         }
 
                         // ---- 进度面板：常驻显示，固定在标签页最底部 ----
@@ -354,9 +512,10 @@ export component MainWindow inherits Window {
 
             Tab { title: strings.tab-log;
                 Rectangle {
-                    background: #F8F9FA;
+                    background: Palette.alternate-background;
                     border-width: 1px;
-                    border-color: #E0E0E0;
+                    // 默认主题：页面内边框为 WPF 原版的极浅 1px 细线 #E0E0E0；Aero 主题沿用 aqua 边框
+                    border-color: FluentPalette.is-aero ? Palette.border : #E0E0E0;
                     border-radius: 4px;
                     VerticalBox {
                         padding: 8px;
@@ -370,27 +529,39 @@ export component MainWindow inherits Window {
                         HorizontalBox {
                             alignment: end;
                             spacing: 10px;
-                            CheckBox { text: strings.check-auto-scroll; checked <=> root.auto-scroll; }
-                            Button { text: strings.button-save-log; clicked => { root.save-log(); } }
+                            CheckBox { text: strings.check-auto-scroll; tooltip-text: strings.tip-auto-scroll; checked <=> root.auto-scroll; }
+                            Button { text: strings.button-save-log; tooltip-text: strings.tip-save-log; clicked => { root.save-log(); } }
                         }
                     }
                 }
             }
         }
 
-        // ---- 底部：开始/停止、语言、关于 ----
+        // ---- 底部：主题（左）、开始/停止、语言、关于（右） ----
         HorizontalBox {
             alignment: end;
             spacing: 10px;
-            Button { text: strings.button-start; enabled: !root.encoding && root.controls-enabled; min-width: 100px; clicked => { root.start-encode(); } }
-            Button { text: strings.button-stop; enabled: root.encoding; min-width: 100px; clicked => { root.stop-encode(); } }
+            ComboBox {
+                width: 90px;
+                model: [strings.theme-default, strings.theme-aero];
+                tooltip-text: strings.tip-theme;
+                current-index <=> root.theme-index;
+                selected => { root.theme-changed(root.theme-index); }
+            }
+            // 弹性占位：把右侧按钮组推回右端
+            Rectangle { horizontal-stretch: 1; }
+            Button { text: strings.button-start; enabled: !root.encoding && root.controls-enabled; min-width: 100px; tooltip-text: strings.tip-start; clicked => { root.start-encode(); } }
+            Button { text: strings.button-stop; enabled: root.encoding; min-width: 100px; tooltip-text: strings.tip-stop; clicked => { root.stop-encode(); } }
             ComboBox {
                 width: 90px;
                 model: ["中文", "English"];
+                tooltip-text: strings.tip-language;
                 current-index <=> root.language-index;
                 selected => { root.language-changed(root.language-index); }
             }
-            Button { text: strings.button-about; clicked => { root.show-about(); } }
+            Button { text: strings.button-about; tooltip-text: strings.tip-about; clicked => { root.show-about(); } }
         }
+
+        } // ---- 主体 VerticalBox 结束 ----
     }
 }

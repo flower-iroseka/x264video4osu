@@ -32,10 +32,21 @@ export component RadioButtonBase {
 
     touch-area := TouchArea {
         clicked => {
+            // 点击时把焦点让给不可见目标，使正在编辑的文本框失焦
+            focus-blank.focus();
             if (root.enabled) {
                 root.selected();
             }
         }
+    }
+
+    // 不可见焦点清除目标：宽度 0、不参与点击与 Tab 遍历，仅作 `focus()` 接收端
+    focus-blank := FocusScope {
+        x: 0;
+        width: 0;
+        height: 0;
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
     }
 
     focus-scope := FocusScope {

@@ -33,6 +33,10 @@ pub struct Strings {
     pub exit_text: String,
     /// 消息对话框确认按钮
     pub ok_text: String,
+    /// 标题栏按钮工具提示
+    pub titlebar_minimize: String,
+    pub titlebar_maximize: String,
+    pub titlebar_close: String,
 }
 
 fn zh() -> Strings {
@@ -58,6 +62,33 @@ fn zh() -> Strings {
             button_about: "关于".into(),
             // 旧程序硬编码英文，不随语言切换
             button_open_folder: "Open Output Folder".into(),
+            // ---- 主题下拉框 ----
+            theme_default: "默认".into(),
+            theme_aero: "Aero".into(),
+            // ---- 悬停工具提示 ----
+            tip_theme: "切换主题".into(),
+            tip_browse_input: "选择要压缩的视频文件".into(),
+            tip_browse_output: "选择输出文件的保存位置".into(),
+            tip_start: "开始编码".into(),
+            tip_stop: "停止编码".into(),
+            tip_about: "查看程序信息".into(),
+            tip_open_folder: "打开输出文件所在文件夹".into(),
+            tip_save_log: "将日志保存为文本文件".into(),
+            tip_format: "选择输出视频的封装格式".into(),
+            tip_language: "切换界面语言".into(),
+            tip_scale_up: "允许将视频放大到指定分辨率".into(),
+            tip_extract_audio: "将音频流分离为独立文件".into(),
+            tip_auto_scroll: "追加日志时自动滚动到底部".into(),
+            tip_titlebar_minimize: "最小化".into(),
+            tip_titlebar_maximize: "最大化".into(),
+            tip_titlebar_close: "关闭窗口".into(),
+            tip_input_path: "输入视频文件路径".into(),
+            tip_output_path: "输出视频文件路径".into(),
+            tip_value: "数值：2pass 为目标码率（kbps），CRF 为质量（0-51）".into(),
+            tip_width: "输出宽度，0 表示保持原始宽度".into(),
+            tip_height: "输出高度，0 表示保持原始高度".into(),
+            tip_method: "编码方法：CRF 恒定质量，或 2pass 精确控制码率".into(),
+            tip_resolution: "输出分辨率".into(),
         },
         about_title: "关于".into(),
         about_version_line: format!("版本 {0}", display_version()),
@@ -72,6 +103,9 @@ fn zh() -> Strings {
         download_text: "下载 FFmpeg".into(),
         exit_text: "退出".into(),
         ok_text: "确定".into(),
+        titlebar_minimize: "最小化".into(),
+        titlebar_maximize: "最大化".into(),
+        titlebar_close: "关闭窗口".into(),
     }
 }
 
@@ -97,6 +131,33 @@ fn en() -> Strings {
             button_save_log: "Save Log".into(),
             button_about: "About".into(),
             button_open_folder: "Open Output Folder".into(),
+            // ---- 主题下拉框 ----
+            theme_default: "Default".into(),
+            theme_aero: "Aero".into(),
+            // ---- 悬停工具提示 ----
+            tip_theme: "Switch theme".into(),
+            tip_browse_input: "Select the video file to compress".into(),
+            tip_browse_output: "Choose where to save the output file".into(),
+            tip_start: "Start encoding".into(),
+            tip_stop: "Stop encoding".into(),
+            tip_about: "Show program information".into(),
+            tip_open_folder: "Open the folder containing the output file".into(),
+            tip_save_log: "Save the log to a text file".into(),
+            tip_format: "Choose the output video container format".into(),
+            tip_language: "Switch the interface language".into(),
+            tip_scale_up: "Allow the video to be upscaled to the specified resolution".into(),
+            tip_extract_audio: "Separate the audio stream into its own file".into(),
+            tip_auto_scroll: "Scroll to the bottom automatically as new log lines are added".into(),
+            tip_titlebar_minimize: "Minimize".into(),
+            tip_titlebar_maximize: "Maximize".into(),
+            tip_titlebar_close: "Close window".into(),
+            tip_input_path: "Input video file path".into(),
+            tip_output_path: "Output video file path".into(),
+            tip_value: "Value: target bitrate (kbps) for 2pass, quality (0-51) for CRF".into(),
+            tip_width: "Output width; 0 keeps the original width".into(),
+            tip_height: "Output height; 0 keeps the original height".into(),
+            tip_method: "Encoding method: CRF constant quality, or 2pass for exact bitrate".into(),
+            tip_resolution: "Output resolution".into(),
         },
         about_title: "About".into(),
         about_version_line: format!("Version {0}", display_version()),
@@ -111,6 +172,9 @@ fn en() -> Strings {
         download_text: "Download FFmpeg".into(),
         exit_text: "Exit".into(),
         ok_text: "OK".into(),
+        titlebar_minimize: "Minimize".into(),
+        titlebar_maximize: "Maximize".into(),
+        titlebar_close: "Close window".into(),
     }
 }
 
@@ -120,11 +184,6 @@ pub fn for_lang(lang: Lang) -> Strings {
         Lang::Zh => zh(),
         Lang::En => en(),
     }
-}
-
-/// 默认语言（旧程序启动加载 zh-CN，语言框默认索引 0）
-pub fn default_lang() -> Lang {
-    Lang::Zh
 }
 
 /// 版本号展示：只取 `+` 之前的部分（对应 `version.Split('+')[0]`）。

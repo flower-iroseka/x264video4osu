@@ -39,7 +39,8 @@ export component RadioButtonImpl inherits RadioButtonImplBase {
             width: 20px;
             height: self.width;
             y: (parent.height - self.height) / 2;
-            background: root.checked ? transparent : FluentPalette.control-alt-secondary;
+            // Aero：微妙玻璃渐变；默认主题：经典平面 control-alt-secondary
+            background: root.checked ? transparent : (FluentPalette.is-aero ? @linear-gradient(180deg, #FFFFFF 0%, #DDEFFA 100%) : FluentPalette.control-alt-secondary);
             border-radius: self.width / 2;
             border-width: 1px;
             border-color: FluentPalette.control-strong-stroke;

@@ -181,6 +181,35 @@ If you must fit a fixed budget exactly (e.g. a beatmap with a strict file-size l
 - Save complete log via "Save Log" button
 - Log file naming format: `log_yyyyMMddHHmmss_randomNumber.txt`
 
+### Theme & Language Switching
+
+The **Theme** dropdown at the bottom-left of the window toggles between "Default" and "Aero"; the **Language** dropdown at the bottom-right toggles between 中文 / English. Changes take effect immediately:
+
+- **Default** (classic): white background, classic blue accent, native system title bar
+- **Aero**: sky-blue gradient background, self-drawn glass title bar, glossy controls
+
+The theme and language selections are saved automatically to a config file and restored on the next launch:
+
+```
+%APPDATA%\x264video4osu\settings.ini
+```
+
+(`APPDATA` is usually `C:\Users\<username>\AppData\Roaming`; if the environment variable is missing, it falls back to the executable's directory.)
+
+The file contains two `key=value` lines:
+
+```ini
+lang=0
+theme=0
+```
+
+| Key | Values | Meaning |
+|-----|--------|---------|
+| `lang` | `0` / `1` | 中文 / English |
+| `theme` | `0` / `1` | Default theme (classic) / Aero |
+
+**Restore defaults**: delete the file, or set both lines to `0` — the next launch returns to the default settings (中文 + Default theme).
+
 ## Technical Parameters
 
 ### Default Encoding Parameters
