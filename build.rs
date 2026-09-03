@@ -80,4 +80,14 @@ fn main() {
     for f in UI_FILES {
         compile_slint(&manifest_dir, &out_dir, f, include_paths.clone());
     }
+
+    // 把 assets/app_icon.ico 作为 Windows 主应用图标嵌入 exe。
+    // 只在 Windows 目标上执行；非 Windows 构建直接跳过。
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rerun-if-changed=assets/app_icon.rc");
+        println!("cargo:rerun-if-changed=assets/app_icon.ico");
+        embed_resource::compile("assets/app_icon.rc", embed_resource::NONE)
+            .manifest_required()
+            .expect("failed to embed app icon");
+    }
 }

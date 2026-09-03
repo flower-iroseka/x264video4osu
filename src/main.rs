@@ -14,6 +14,7 @@ mod io;
 mod platform;
 mod services;
 mod win_flash;
+mod win_icon;
 #[cfg(test)]
 mod log_layout_test;
 #[cfg(test)]

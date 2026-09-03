@@ -1,6 +1,6 @@
 [package]
 name = "x264video4osu"
-version = "2.1.0"
+version = "2.1.1"
 edition = "2021"
 description = "Rust + Slint port of x264video4osu (osu! background video compressor)"
 license = "MIT"
@@ -24,6 +24,7 @@ open = "5.4.2"
 windows-sys = { version = "0.61", features = [
     "Win32_System_SystemInformation",
     "Win32_Foundation",
+    "Win32_System_LibraryLoader", # win_icon：GetModuleHandleW 取进程模块以加载图标资源
     "Win32_UI_WindowsAndMessaging",
 ] }
 
@@ -38,6 +39,9 @@ i-slint-backend-testing = "1.17.1"
 i-slint-renderer-femtovg = { path = "third_party/i-slint-renderer-femtovg" }
 
 [build-dependencies]
+# 编译 assets/app_icon.rc，把 assets/app_icon.ico 作为 Windows 资源嵌入 exe
+# （主应用图标，Explorer/任务栏/Alt-Tab 读取）。纯构建期，运行时不引入依赖。
+embed-resource = "3"
 # 自定义 build.rs 直接驱动 i-slint-compiler：开启 enable_experimental，
 # 使文件系统加载的自定义风格（third_party/fluent-lite）能访问内部类型
 # （TabWidget / SlintInternal）与 experimental interface（uses/implements）特性。

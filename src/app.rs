@@ -267,6 +267,9 @@ impl AppController {
             if let Some(c) = w.upgrade() {
                 const WINDOW_W: f32 = 572.0; // 与 ui/main.slint 的 Window width 保持一致
                 let c = c.borrow();
+                // 原生标题栏不会自动采用 exe 资源图标：启动后把嵌入的应用图标设为窗口图标。
+                let hwnd = crate::win_icon::main_window_hwnd(c.ui.window());
+                crate::win_icon::apply_window_icon(hwnd);
                 // 与 ui/main.slint 的 Window height 保持一致：Aero 577（内容 545 + 标题栏 32），默认主题 545
                 let window_h = if c.settings.theme().is_aero() { 577.0 } else { 545.0 };
                 let win = c.ui.window();
@@ -351,6 +354,10 @@ impl AppController {
                 self.ui.set_result_visible(false);
                 self.ui.set_progress_value(0.0);
 
+                // 新编码开始即清空日志：log_buffer / 行模型只增不清，若不清空，
+                // 同进程内多次编码会无限累积（内存随会话一直涨，且"保存日志"
+                // 存到的会是历次编码拼在一起的全量文本）。
+                self.reset_log();
                 self.log_config_lines();
                 self.service.reset();
                 self.service.start(plan);
@@ -602,6 +609,13 @@ impl AppController {
     // =============================================================
     // 日志与配置记录
     // =============================================================
+
+    /// 清空日志缓冲与逐行模型（仅在新编码开始前调用；校验失败不清，保留上一次日志）。
+    /// VecModel::clear 会广播 row_removed，日志页 ListView 同步清空。
+    fn reset_log(&mut self) {
+        self.log_buffer.clear();
+        self.log_lines_model.clear();
+    }
 
     fn append_log(&mut self, msg: &str) {
         self.log_buffer.push_str(msg);

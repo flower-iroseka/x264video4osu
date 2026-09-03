@@ -1,0 +1,3 @@
+// x264video4osu 程序图标资源。经 embed-resource 在 build.rs 中编译进 exe。
+// ID 1 作为主应用图标（RT_GROUP_ICON），Explorer/任务栏/Alt-Tab 均读取。
+1 ICON "app_icon.ico"
