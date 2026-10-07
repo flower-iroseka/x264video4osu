@@ -1,64 +1,33 @@
-import { Button, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
-import { AeroTitleBar } from "../aero-title-bar.slint";
-import { FluentPalette } from "styling.slint";
+import { Button, VerticalBox } from "std-widgets.slint";
+import { DialogWindow } from "dialog-base.slint";
 
-export component AboutDialog inherits Window {
-    title: root.dialog-title;
-    // 主题：theme-index 0 = 默认主题（系统原生标题栏），1 = Aero（自绘玻璃标题栏）
-    no-frame: root.theme-index == 1;
+export component AboutDialog inherits DialogWindow {
     width: 440px;
-    height: root.theme-index == 1 ? 452px : 420px;
-    background: Palette.background;
+    height: 420px;
+    title: root.dialog-title;
 
-    in-out property <int> theme-index: 0;
+    /// 窗口的逻辑尺寸。Rust 侧要在窗口创建**之前**算出摆在哪，那会儿
+    /// `Window::size()` 还是 0，得从这个绑定读。
+    out property <length> dialog-w: root.width;
+    out property <length> dialog-h: root.height;
+
     in property <string> dialog-title;
     in property <string> description;
     in property <string> version-line;
     in property <string> repository-text;
     in property <string> close-text;
 
-    in property <string> titlebar-tooltip-minimize;
-    in property <string> titlebar-tooltip-maximize;
-    in property <string> titlebar-tooltip-close;
-
-    // 由 Rust 端在检测到「点击被禁用的主窗口」时置 true、80ms 后复位；
-    // 驱动下方闪烁层（标题栏高光 + 边框细亮环）的「瞬时全亮、缓出淡出」动画。
-    in property <bool> flash: false;
-
     callback open-repository();
     callback close-dialog();
-    callback title-bar-drag();
-    callback title-bar-minimize();
-    callback title-bar-close();
-
-    // 把主题索引写入 FluentPalette 全局（驱动所有控件换肤）。FluentPalette 来自
-    // 导入文件，不生成 Rust 访问器，只能靠这个 public 函数从 Rust 端 invoke 同步设置。
-    public function apply-theme(t: int) {
-        FluentPalette.is-aero = t == 1;
-        root.theme-index = t;
-    }
 
     base := Rectangle {
         width: parent.width;
         height: parent.height;
 
-        // ---- Frutiger Aero 标题栏（仅 Aero 主题） ----
-        if root.theme-index == 1 : AeroTitleBar {
-            window-title: root.dialog-title;
-            tooltip-minimize: root.titlebar-tooltip-minimize;
-            tooltip-maximize: root.titlebar-tooltip-maximize;
-            tooltip-close: root.titlebar-tooltip-close;
-            width: parent.width;
-            y: 0;
-            drag-pressed => { root.title-bar-drag(); }
-            minimize => { root.title-bar-minimize(); }
-            close => { root.title-bar-close(); }
-        }
-
         VerticalBox {
-            y: root.theme-index == 1 ? 32px : 0px;
+            y: 0px;
             width: parent.width;
-            height: parent.height - (root.theme-index == 1 ? 32px : 0px);
+            height: parent.height;
             padding: 32px;
             spacing: 8px;
 
@@ -71,8 +40,8 @@ export component AboutDialog inherits Window {
             Text {
                 text: root.version-line;
                 font-size: 13px;
-                // Aero 主题青灰；默认主题还原老版灰 #6B7280
-                color: FluentPalette.is-aero ? #335A6E : #6B7280;
+                // 老版灰
+                color: #6B7280;
                 horizontal-alignment: center;
             }
             Rectangle { height: 24px; }
@@ -89,7 +58,7 @@ export component AboutDialog inherits Window {
                 clicked => { root.open-repository(); }
             }
             Rectangle { height: 0px; vertical-stretch: 1; }
-            HorizontalBox {
+            HorizontalLayout {
                 alignment: center;
                 Button {
                     text: root.close-text;
@@ -97,48 +66,6 @@ export component AboutDialog inherits Window {
                     tooltip-text: root.close-text;
                     clicked => { root.close-dialog(); }
                 }
-            }
-        }
-
-        // 点击被禁用的主窗口时，标题栏与边框闪烁一次（仿 XP 模态对话框反馈）。
-        // 必须放在 base 最上层（最后声明）；元素均无 TouchArea，不拦截鼠标，
-        // 不影响按钮悬停/工具提示。
-        Rectangle {
-            width: parent.width;
-            height: parent.height;
-
-            // 标题栏高光：瞬时全亮、缓出淡出
-            Rectangle {
-                y: 0;
-                width: parent.width;
-                height: 32px;
-                background: @linear-gradient(180deg, #FFFFFF 0%, #E9F6FF 100%);
-                opacity: 0;
-                states [
-                    flashing when root.flash: {
-                        opacity: 0.9;
-                        in { animate opacity { duration: 0ms; } }
-                        out { animate opacity { duration: 320ms; easing: ease-out; } }
-                    }
-                ]
-            }
-
-            // 四周细亮环（模拟边框闪烁）
-            Rectangle {
-                x: 0;
-                y: 0;
-                width: parent.width;
-                height: parent.height;
-                border-width: 2px;
-                border-color: #FFFFFF;
-                opacity: 0;
-                states [
-                    flashing when root.flash: {
-                        opacity: 1;
-                        in { animate opacity { duration: 0ms; } }
-                        out { animate opacity { duration: 320ms; easing: ease-out; } }
-                    }
-                ]
             }
         }
     }

@@ -1,6 +1,6 @@
 [package]
 name = "x264video4osu"
-version = "2.1.1"
+version = "3.0.0"
 edition = "2021"
 description = "Rust + Slint port of x264video4osu (osu! background video compressor)"
 license = "MIT"
@@ -19,13 +19,16 @@ open = "5.4.2"
 # 仅用 GetLocalTime 生成时间戳（旧程序使用 DateTime.Now 格式化）
 # windows-sys 0.61 中 GetLocalTime 位于 Win32_System_SystemInformation，
 # SYSTEMTIME 位于 Win32_Foundation（随该 feature 一并启用）。
-# Win32_UI_WindowsAndMessaging 用于关于窗口的「点击主窗口 → 标题栏闪烁」：
-# WH_MOUSE_LL 低级鼠标钩子（SetWindowsHookExW / CallNextHookEx / WindowFromPoint）。
+# Win32_UI_WindowsAndMessaging / Win32_UI_Input_KeyboardAndMouse / Win32_Graphics_Gdi
+# 用于对话框的原生模态与居中定位（见 win_dialog 模块）。
 windows-sys = { version = "0.61", features = [
     "Win32_System_SystemInformation",
     "Win32_Foundation",
     "Win32_System_LibraryLoader", # win_icon：GetModuleHandleW 取进程模块以加载图标资源
-    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_WindowsAndMessaging", # 对话框：owner 关系、移动窗口、置前（EnableWindow 不在这里）
+    "Win32_UI_Input_KeyboardAndMouse", # EnableWindow：模态期间禁用主窗口
+    "Win32_Graphics_Gdi", # MonitorFromWindow / GetMonitorInfoW：取显示器工作区做居中
+    "Win32_UI_HiDpi", # AdjustWindowRectExForDpi / GetDpiForWindow：算外框，显示前摆好位置
 ] }
 
 [dev-dependencies]

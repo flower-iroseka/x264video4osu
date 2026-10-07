@@ -21,6 +21,8 @@ This is just an FFmpeg frontend to solve my personal video compression needs. Ev
 - Supports **2-Pass VBR** and **CRF** encoding modes
 - Real-time encoding progress display (percentage, elapsed time, ETA)
 - Custom output resolution (scaling supported)
+- Audio mode: no audio / copy audio stream / transcode audio (AAC, FLAC)
+- Video trimming: set a start/end range by frame number or by time
 - Optional audio extraction
 - Supports Chinese and English interface
 - Detailed encoding log recording and export
@@ -163,7 +165,9 @@ If you must fit a fixed budget exactly (e.g. a beatmap with a strict file-size l
    | **Value box** | 2pass = bitrate, CRF = quality value |
    | **Resolution** | Width × Height, set to 0 to keep original |
    | **Scale Up** | Allow upscaling (disabled by default) |
-   | **Extract Audio** | Extract audio track separately as .m4a file |
+   | **Audio mode** | No audio (default) / Copy audio stream / Transcode audio (AAC or FLAC; FLAC is mp4-only) |
+   | **Trim video** | Check to set a start/end range, by frame number or by time (HH:MM:SS.mmm) |
+   | **Extract Audio** | Extract audio track separately as .m4a file; when trimming, the exported track covers the trimmed range |
 
 5. **Click "Start"** to begin encoding
 
@@ -181,14 +185,11 @@ If you must fit a fixed budget exactly (e.g. a beatmap with a strict file-size l
 - Save complete log via "Save Log" button
 - Log file naming format: `log_yyyyMMddHHmmss_randomNumber.txt`
 
-### Theme & Language Switching
+### Language Switching
 
-The **Theme** dropdown at the bottom-left of the window toggles between "Default" and "Aero"; the **Language** dropdown at the bottom-right toggles between 中文 / English. Changes take effect immediately:
+The **Language** dropdown at the bottom-right of the window toggles between 中文 / English. The change takes effect immediately.
 
-- **Default** (classic): white background, classic blue accent, native system title bar
-- **Aero**: sky-blue gradient background, self-drawn glass title bar, glossy controls
-
-The theme and language selections are saved automatically to a config file and restored on the next launch:
+The language selection is saved automatically to a config file and restored on the next launch:
 
 ```
 %APPDATA%\x264video4osu\settings.ini
@@ -196,19 +197,17 @@ The theme and language selections are saved automatically to a config file and r
 
 (`APPDATA` is usually `C:\Users\<username>\AppData\Roaming`; if the environment variable is missing, it falls back to the executable's directory.)
 
-The file contains two `key=value` lines:
+The file contains a single `key=value` line:
 
 ```ini
 lang=0
-theme=0
 ```
 
 | Key | Values | Meaning |
 |-----|--------|---------|
 | `lang` | `0` / `1` | 中文 / English |
-| `theme` | `0` / `1` | Default theme (classic) / Aero |
 
-**Restore defaults**: delete the file, or set both lines to `0` — the next launch returns to the default settings (中文 + Default theme).
+**Restore defaults**: delete the file, or set the line to `0` — the next launch returns to the default setting (中文).
 
 ## Technical Parameters
 

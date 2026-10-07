@@ -1,7 +1,7 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-import { FluentPalette, Icons } from "styling.slint";
+import { FluentMetrics, FluentPalette, Icons } from "styling.slint";
 import { FocusBorder } from "components.slint";
 
 export component CheckBox {
@@ -17,7 +17,8 @@ export component CheckBox {
 
     private property <color> text-color: FluentPalette.foreground;
 
-    min-height: max(18px, layout.min-height);
+    // 原样式 18px。跟 12px 的字号对齐，收到 13px。
+    min-height: max(13px, layout.min-height);
     accessible-checkable: true;
     accessible-enabled: root.enabled;
     accessible-label: root.text;
@@ -54,43 +55,49 @@ export component CheckBox {
     animate text-color { duration: 200ms; }
 
     layout := HorizontalLayout {
-        spacing: 12px;
+        // 原样式是 12px，和行内其它控件比显得方框离文字太远；收到 6px。
+        spacing: 6px;
 
-        background := Rectangle {
-            width: 18px;
+        // 布局只管 x，方框自己定位才吸附得了整数设备像素，所以套一层等大的透明占位。
+        box-slot := Rectangle {
+            width: 13px;
             height: self.width;
             y: (parent.height - self.height) / 2;
-            // Aero：微妙玻璃渐变 + 上缘高光；默认主题：经典平面 control-alt-secondary
-            background: FluentPalette.is-aero ? @linear-gradient(180deg, #FFFFFF 0%, #E2F4FD 100%) : FluentPalette.control-alt-secondary;
-            border-radius: 2px;
-            clip: true;
+            background: transparent;
 
-            animate background, border-color { duration: 150ms; }
+            background := Rectangle {
+                // 原样式 18px。边长和位置都吸附到整数设备像素：布局算出来的坐标常带
+                // 小数设备像素，1px 的边框横跨两个像素就会被抗锯齿摊成两条浅灰线，
+                // 看着比系统控件糊。吸附之后边框才是一条实的细线。
+                width: round(13px / FluentMetrics.device-pixel) * FluentMetrics.device-pixel;
+                height: self.width;
+                x: FluentMetrics.snap(box-slot.absolute-position.x) - box-slot.absolute-position.x;
+                // 再往下挪一个设备像素：汉字的墨迹本来就比行框中心低一点，
+                // 只按行框中点摆的话方框看起来会偏上（实测差 1 个设备像素）。
+                y: FluentMetrics.snap(box-slot.absolute-position.y + (box-slot.height - self.height) / 2)
+                    + FluentMetrics.device-pixel - box-slot.absolute-position.y;
+                background: FluentPalette.control-alt-secondary;
+                border-radius: 2px;
 
-            Rectangle {
-                visible: FluentPalette.is-aero;
-                x: 1px;
-                y: 1px;
-                width: parent.width - 2px;
-                height: 8px;
-                background: @linear-gradient(180deg, #FFFFFFE6 0%, #FFFFFF30 100%);
-            }
+                animate background, border-color { duration: 150ms; }
 
-            border := Rectangle {
-                border-color: FluentPalette.control-strong-stroke;
-                border-width: root.checked ? 0 : 1px;
-                border-radius: parent.border-radius;
-            }
+                border := Rectangle {
+                    border-color: FluentPalette.control-strong-stroke;
+                    // 按设备像素算，1 逻辑像素在 125% 下是 1.25 设备像素，会多出半格灰边
+                    border-width: root.checked ? 0 : FluentMetrics.device-pixel;
+                    border-radius: parent.border-radius;
+                }
 
-            icon := Image {
-                image-fit: contain;
-                visible: root.checked;
-                source: Icons.check-mark;
-                colorize: FluentPalette.accent-foreground;
-                width: 12px;
-                accessible-role: none;
+                icon := Image {
+                    image-fit: contain;
+                    visible: root.checked;
+                    source: Icons.check-mark;
+                    colorize: FluentPalette.accent-foreground;
+                    width: 8px;
+                    accessible-role: none;
 
-                animate colorize { duration: 150ms; }
+                    animate colorize { duration: 150ms; }
+                }
             }
         }
 

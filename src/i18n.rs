@@ -2,9 +2,11 @@
 //! 以及旧界面中硬编码的英文文案）。
 //!
 //! 注意：旧程序中「Open Output Folder」按钮文案是硬编码英文，不随语言切换；
-//! 进度/结果文本（Pass / ETA / Elapsed / Output size）同样是硬编码英文。
-//! 校验失败提示（Input file path cannot be empty. 等）也是硬编码英文，
+//! 进度/结果文本（Pass / ETA / Elapsed / Output size）同样是硬编码英文，
 //! 因此这里两种语言下保持一致。
+//!
+//! 校验提示和错误提示旧程序也是写死的英文，这里补上了中文（见 `title_*` / `msg_*`）。
+//! 里面带 `{...}` 的是模板，由 app.rs 在运行时替换。
 
 use crate::services::ffmpeg_config::tools_folder;
 use crate::UiStrings;
@@ -33,10 +35,41 @@ pub struct Strings {
     pub exit_text: String,
     /// 消息对话框确认按钮
     pub ok_text: String,
-    /// 标题栏按钮工具提示
-    pub titlebar_minimize: String,
-    pub titlebar_maximize: String,
-    pub titlebar_close: String,
+    /// 消息对话框标题：校验不通过 / 真正的失败
+    pub title_validation: String,
+    pub title_error: String,
+    /// 输入校验提示
+    pub msg_empty_input: String,
+    pub msg_invalid_input: String,
+    pub msg_input_not_found: String,
+    pub msg_invalid_drop: String,
+    /// 编码启动失败提示模板：`{detail}` 是底层错误原文
+    pub msg_invalid_parameter: String,
+    pub msg_encode_failed: String,
+    /// 裁剪参数校验提示；`{text}` 是用户填的原文
+    pub msg_no_fps: String,
+    pub msg_invalid_frame: String,
+    pub msg_invalid_time: String,
+    pub msg_trim_order: String,
+    /// 「视频里有两遍内容」对话框：标题、正文模板、两个按钮
+    ///
+    /// 正文里的 `{once}` / `{twice}` 由 app.rs 在运行时替换成长度文本。
+    pub repeat_title: String,
+    pub repeat_message: String,
+    pub repeat_once_text: String,
+    pub repeat_twice_text: String,
+    /// 把秒数写成用户看得懂的长度：中文「2 分 55 秒」，英文「2:55」
+    pub duration_text: fn(f64) -> String,
+}
+
+fn zh_duration(secs: f64) -> String {
+    let total = secs.round().max(0.0) as u64;
+    format!("{} 分 {} 秒", total / 60, total % 60)
+}
+
+fn en_duration(secs: f64) -> String {
+    let total = secs.round().max(0.0) as u64;
+    format!("{}:{:02}", total / 60, total % 60)
 }
 
 fn zh() -> Strings {
@@ -62,11 +95,21 @@ fn zh() -> Strings {
             button_about: "关于".into(),
             // 旧程序硬编码英文，不随语言切换
             button_open_folder: "Open Output Folder".into(),
-            // ---- 主题下拉框 ----
-            theme_default: "默认".into(),
-            theme_aero: "Aero".into(),
+            // ---- 音频模式 ----
+            label_audio_mode: "音频模式".into(),
+            audio_none: "无音频".into(),
+            audio_copy: "复制音频流".into(),
+            audio_transcode: "转码音频".into(),
+            label_audio_codec: "音频编码".into(),
+            // ---- 视频裁剪 ----
+            check_trim: "裁剪视频".into(),
+            label_trim_unit: "裁剪单位".into(),
+            trim_frames: "帧".into(),
+            trim_time: "时间".into(),
+            label_trim_range: "裁剪范围".into(),
+            label_trim_start: "起点".into(),
+            label_trim_end: "终点".into(),
             // ---- 悬停工具提示 ----
-            tip_theme: "切换主题".into(),
             tip_browse_input: "选择要压缩的视频文件".into(),
             tip_browse_output: "选择输出文件的保存位置".into(),
             tip_start: "开始编码".into(),
@@ -79,9 +122,12 @@ fn zh() -> Strings {
             tip_scale_up: "允许将视频放大到指定分辨率".into(),
             tip_extract_audio: "将音频流分离为独立文件".into(),
             tip_auto_scroll: "追加日志时自动滚动到底部".into(),
-            tip_titlebar_minimize: "最小化".into(),
-            tip_titlebar_maximize: "最大化".into(),
-            tip_titlebar_close: "关闭窗口".into(),
+            tip_audio_mode: "输出视频中的音频处理方式".into(),
+            tip_audio_codec: "转码音频时使用的编码器（FLAC 仅支持 mp4）".into(),
+            tip_trim: "勾选后可裁剪视频的起止范围".into(),
+            tip_trim_unit: "按帧号或按时间裁剪。按帧需要先读取源视频帧率".into(),
+            tip_trim_start: "起始位置：帧号，或 时:分:秒.毫秒".into(),
+            tip_trim_end: "结束位置：帧号，或 时:分:秒.毫秒".into(),
             tip_input_path: "输入视频文件路径".into(),
             tip_output_path: "输出视频文件路径".into(),
             tip_value: "数值：2pass 为目标码率（kbps），CRF 为质量（0-51）".into(),
@@ -103,9 +149,28 @@ fn zh() -> Strings {
         download_text: "下载 FFmpeg".into(),
         exit_text: "退出".into(),
         ok_text: "确定".into(),
-        titlebar_minimize: "最小化".into(),
-        titlebar_maximize: "最大化".into(),
-        titlebar_close: "关闭窗口".into(),
+        title_validation: "校验失败".into(),
+        title_error: "错误".into(),
+        msg_empty_input: "视频输入路径不能为空。".into(),
+        msg_invalid_input: "视频输入路径无效。".into(),
+        msg_input_not_found: "找不到输入的视频文件。".into(),
+        msg_invalid_drop: "拖入的文件路径无效。".into(),
+        msg_invalid_parameter: "参数不合法：{detail}".into(),
+        msg_encode_failed: "启动编码失败：{detail}".into(),
+        msg_no_fps: "读不出源视频的帧率，请改用按时间裁剪。".into(),
+        msg_invalid_frame: "帧号不合法：{text}".into(),
+        msg_invalid_time: "时间不合法：{text}".into(),
+        msg_trim_order: "裁剪终点必须大于起点。".into(),
+        repeat_title: "检测到edit list".into(),
+        repeat_message: "视频轨的edit list将同一段视频重复播放了两次。\n\
+                         记录的真实时长： {once}\n\
+                         实际播放的时长： {twice}\n\n\
+                         忽略编辑列表，则只转换一遍正片。保留编辑列表，则输出重复两遍的视频。\
+                         （若您未编辑过本视频，推荐选择忽略。）"
+            .into(),
+        repeat_once_text: "忽略编辑列表".into(),
+        repeat_twice_text: "保留编辑列表".into(),
+        duration_text: zh_duration,
     }
 }
 
@@ -131,11 +196,21 @@ fn en() -> Strings {
             button_save_log: "Save Log".into(),
             button_about: "About".into(),
             button_open_folder: "Open Output Folder".into(),
-            // ---- 主题下拉框 ----
-            theme_default: "Default".into(),
-            theme_aero: "Aero".into(),
+            // ---- 音频模式 ----
+            label_audio_mode: "Audio mode".into(),
+            audio_none: "No audio".into(),
+            audio_copy: "Copy audio stream".into(),
+            audio_transcode: "Transcode audio".into(),
+            label_audio_codec: "Audio codec".into(),
+            // ---- 视频裁剪 ----
+            check_trim: "Trim video".into(),
+            label_trim_unit: "Trim unit".into(),
+            trim_frames: "Frames".into(),
+            trim_time: "Time".into(),
+            label_trim_range: "Trim range".into(),
+            label_trim_start: "Start".into(),
+            label_trim_end: "End".into(),
             // ---- 悬停工具提示 ----
-            tip_theme: "Switch theme".into(),
             tip_browse_input: "Select the video file to compress".into(),
             tip_browse_output: "Choose where to save the output file".into(),
             tip_start: "Start encoding".into(),
@@ -148,9 +223,12 @@ fn en() -> Strings {
             tip_scale_up: "Allow the video to be upscaled to the specified resolution".into(),
             tip_extract_audio: "Separate the audio stream into its own file".into(),
             tip_auto_scroll: "Scroll to the bottom automatically as new log lines are added".into(),
-            tip_titlebar_minimize: "Minimize".into(),
-            tip_titlebar_maximize: "Maximize".into(),
-            tip_titlebar_close: "Close window".into(),
+            tip_audio_mode: "How audio is handled in the output video".into(),
+            tip_audio_codec: "Audio codec used when transcoding (FLAC is mp4-only)".into(),
+            tip_trim: "Check to trim the start/end range of the video".into(),
+            tip_trim_unit: "Trim by frame number or by time. Frames require reading the source frame rate".into(),
+            tip_trim_start: "Start position: frame number, or HH:MM:SS.mmm".into(),
+            tip_trim_end: "End position: frame number, or HH:MM:SS.mmm".into(),
             tip_input_path: "Input video file path".into(),
             tip_output_path: "Output video file path".into(),
             tip_value: "Value: target bitrate (kbps) for 2pass, quality (0-51) for CRF".into(),
@@ -172,9 +250,28 @@ fn en() -> Strings {
         download_text: "Download FFmpeg".into(),
         exit_text: "Exit".into(),
         ok_text: "OK".into(),
-        titlebar_minimize: "Minimize".into(),
-        titlebar_maximize: "Maximize".into(),
-        titlebar_close: "Close window".into(),
+        title_validation: "Validation Error".into(),
+        title_error: "Error".into(),
+        msg_empty_input: "Input file path cannot be empty.".into(),
+        msg_invalid_input: "Invalid input file path.".into(),
+        msg_input_not_found: "Input file not found.".into(),
+        msg_invalid_drop: "Invalid file path dropped.".into(),
+        msg_invalid_parameter: "Invalid parameter: {detail}".into(),
+        msg_encode_failed: "Failed to start encoding: {detail}".into(),
+        msg_no_fps: "Cannot determine the source frame rate; use time input instead.".into(),
+        msg_invalid_frame: "Invalid frame number: {text}".into(),
+        msg_invalid_time: "Invalid time: {text}".into(),
+        msg_trim_order: "Trim end must be greater than start.".into(),
+        repeat_title: "Edit list detected".into(),
+        repeat_message: "The video track's edit list plays the same video twice.\n\
+                         Recorded duration: {once}\n\
+                         Playback duration: {twice}\n\n\
+                         Ignoring the edit list converts only the actual footage; keeping it outputs \
+                         a video that repeats. (If you did not edit this video yourself, ignoring is recommended.)"
+            .into(),
+        repeat_once_text: "Ignore edit list".into(),
+        repeat_twice_text: "Keep edit list".into(),
+        duration_text: en_duration,
     }
 }
 

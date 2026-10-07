@@ -12,5 +12,16 @@ log_*.log.mbtree
 # Release bundle (built artifacts, ffmpeg/ffprobe are large binaries)
 /release
 
-# Claude Code local settings
-.claude/settings.local.json
+# 随程序分发的 ffmpeg / ffprobe（几十 MB 的二进制，不进版本库）
+/tools
+
+# 一次性测试目录：跑测试时自动重建，里面的截图和临时素材不用管
+/tests-001
+
+# 手动测试用的视频素材（单个上百 MB）
+/tests/*.mp4
+/tests/*.flv
+
+# Claude Code 的本地设置、以及 AI 生成的开发过程文档（迁移分析、重构记录等）。
+# 这些只放本地，不进版本库。
+/.claude/

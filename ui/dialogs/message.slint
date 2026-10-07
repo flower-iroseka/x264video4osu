@@ -1,73 +1,79 @@
-import { Button, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
-import { AeroTitleBar } from "../aero-title-bar.slint";
-import { FluentPalette } from "styling.slint";
+import { Button, VerticalBox } from "std-widgets.slint";
+import { DialogWindow } from "dialog-base.slint";
 
-export component MessageDialog inherits Window {
+// 消息框，布局照 Windows 自带的消息框来：左边一个图标，右边正文，按钮靠右下角。
+export component MessageDialog inherits DialogWindow {
+    dialog-background: #FFFFFF;
+    width: 420px;
+    // 高度贴合内容。窗口宽度是固定的，正文换行结果就是确定的，所以布局的
+    // preferred-height 算得出来。中英文正文行数不一样，各自得到正好的高度，
+    // 不用按语言分别写死一个数值。
+    height: content.preferred-height;
     title: root.dialog-title;
-    // 主题：theme-index 0 = 默认主题（系统原生标题栏），1 = Aero（自绘玻璃标题栏）
-    no-frame: root.theme-index == 1;
-    width: 380px;
-    height: root.theme-index == 1 ? 202px : 170px;
-    background: Palette.background;
 
-    in-out property <int> theme-index: 0;
     in property <string> dialog-title;
+    /// 窗口的逻辑尺寸。Rust 侧要在窗口创建**之前**算出摆在哪，那会儿
+    /// `Window::size()` 还是 0，得从这个绑定读。
+    out property <length> dialog-w: root.width;
+    out property <length> dialog-h: root.height;
+
     in property <string> message;
     in property <string> ok-text;
-
-    in property <string> titlebar-tooltip-minimize;
-    in property <string> titlebar-tooltip-maximize;
-    in property <string> titlebar-tooltip-close;
+    /// 第二个按钮的文案；空串表示只显示一个按钮
+    in property <string> alt-text;
+    /// 左侧图标：none / info / warning / error
+    in property <string> icon-kind: "none";
 
     callback ok();
-    callback title-bar-drag();
-    callback title-bar-minimize();
-    callback title-bar-close();
+    callback alt();
 
-    // 把主题索引写入 FluentPalette 全局（驱动所有控件换肤）。FluentPalette 来自
-    // 导入文件，不生成 Rust 访问器，只能靠这个 public 函数从 Rust 端 invoke 同步设置。
-    public function apply-theme(t: int) {
-        FluentPalette.is-aero = t == 1;
-        root.theme-index = t;
-    }
+    content := VerticalBox {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 14px;
+        padding-bottom: 12px;
+        // 正文和按钮之间的空当
+        spacing: 16px;
 
-    base := Rectangle {
-        width: parent.width;
-        height: parent.height;
+        HorizontalLayout {
+            spacing: 12px;
 
-        // ---- Frutiger Aero 标题栏（仅 Aero 主题） ----
-        if root.theme-index == 1 : AeroTitleBar {
-            window-title: root.dialog-title;
-            tooltip-minimize: root.titlebar-tooltip-minimize;
-            tooltip-maximize: root.titlebar-tooltip-maximize;
-            tooltip-close: root.titlebar-tooltip-close;
-            width: parent.width;
-            y: 0;
-            drag-pressed => { root.title-bar-drag(); }
-            minimize => { root.title-bar-minimize(); }
-            close => { root.title-bar-close(); }
-        }
-
-        VerticalBox {
-            y: root.theme-index == 1 ? 32px : 0px;
-            width: parent.width;
-            height: parent.height - (root.theme-index == 1 ? 32px : 0px);
-            padding: 20px;
-            spacing: 16px;
+            if root.icon-kind != "none" : Image {
+                width: 32px;
+                height: 32px;
+                image-fit: contain;
+                source: root.icon-kind == "warning" ? @image-url("message-warning.svg")
+                      : root.icon-kind == "error" ? @image-url("message-error.svg")
+                      : @image-url("message-info.svg");
+            }
 
             Text {
                 text: root.message;
                 wrap: word-wrap;
+                horizontal-stretch: 1;
+                vertical-alignment: top;
+                // 跟按钮和主界面上的文字一样大，默认的 14px 在这个尺寸的消息框里偏大
+                font-size: 12px;
             }
-            Rectangle { height: 0px; vertical-stretch: 1; }
-            HorizontalBox {
-                alignment: center;
-                Button {
-                    text: root.ok-text;
-                    width: 100px;
-                    tooltip-text: root.ok-text;
-                    clicked => { root.ok(); }
-                }
+        }
+
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+            Button {
+                text: root.ok-text;
+                height: 32px;
+                min-width: 96px;
+                primary: true;
+                tooltip-text: root.ok-text;
+                clicked => { root.ok(); }
+            }
+            if root.alt-text != "" : Button {
+                text: root.alt-text;
+                height: 32px;
+                min-width: 96px;
+                tooltip-text: root.alt-text;
+                clicked => { root.alt(); }
             }
         }
     }

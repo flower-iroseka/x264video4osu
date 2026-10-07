@@ -21,16 +21,9 @@ export component Button {
 
     private property <brush> text-color: primary || checked ? FluentPalette.accent-foreground : FluentPalette.control-foreground;
 
-    // XP/Vista 光泽按钮：竖直流光渐变（上亮下暗）+ 上缘白色高光带
-    private property <brush> gloss-base: @linear-gradient(180deg, #FFFFFF 0%, #D6EDFB 48%, #A9D8F2 100%);
-    private property <brush> gloss-hover: @linear-gradient(180deg, #FFFFFF 0%, #E6F7FF 48%, #C3E9FB 100%);
-    private property <brush> gloss-pressed: @linear-gradient(180deg, #A8D4EE 0%, #C2E7FA 48%, #EAF9FF 100%);
-    private property <brush> gloss-primary: @linear-gradient(180deg, #3FC0F5 0%, #00A8E8 48%, #0088C2 100%);
-    private property <brush> gloss-primary-hover: @linear-gradient(180deg, #6BD2FA 0%, #22B4EE 48%, #0097D4 100%);
-    private property <brush> gloss-primary-pressed: @linear-gradient(180deg, #007DB6 0%, #009AD4 48%, #2FBCF1 100%);
-
     min-width: max(32px, i-layout.min-width);
-    min-height: max(32px, i-layout.min-height);
+    // 原样式 32px，和输入框、下拉框一起压到 28px，否则同一行里按钮会高出一截。
+    min-height: max(28px, i-layout.min-height);
     horizontal-stretch: 0;
     vertical-stretch: 0;
     forward-focus: i-focus-scope;
@@ -49,15 +42,15 @@ export component Button {
             root.text-color: root.primary || root.checked ? FluentPalette.text-accent-foreground-disabled : FluentPalette.text-disabled;
         }
         pressed when root.pressed : {
-            i-background.background: root.primary || root.checked ? (FluentPalette.is-aero ? gloss-primary-pressed : FluentPalette.tertiary-accent-background) : (FluentPalette.is-aero ? gloss-pressed : FluentPalette.control-tertiary);
+            i-background.background: root.primary || root.checked ? FluentPalette.tertiary-accent-background : FluentPalette.control-tertiary;
             i-border.border-color: FluentPalette.border;
             root.text-color: root.primary || root.checked ? FluentPalette.text-accent-foreground-secondary : FluentPalette.text-secondary;
         }
         hover when i-touch-area.has-hover : {
-            i-background.background: root.primary || root.checked ? (FluentPalette.is-aero ? gloss-primary-hover : FluentPalette.secondary-accent-background) : (FluentPalette.is-aero ? gloss-hover : FluentPalette.control-secondary);
+            i-background.background: root.primary || root.checked ? FluentPalette.secondary-accent-background : FluentPalette.control-secondary;
         }
         checked when root.checked : {
-            i-background.background: FluentPalette.is-aero ? gloss-primary : FluentPalette.accent-background;
+            i-background.background: FluentPalette.accent-background;
             i-border.border-color: FluentPalette.accent-control-border;
             root.text-color: FluentPalette.accent-foreground;
         }
@@ -65,22 +58,9 @@ export component Button {
 
     i-background := Rectangle {
         border-radius: 4px;
-        background: root.primary ? (FluentPalette.is-aero ? gloss-primary : FluentPalette.accent-background) : (FluentPalette.is-aero ? gloss-base : FluentPalette.control-background);
-        clip: true;
+        background: root.primary ? FluentPalette.accent-background : FluentPalette.control-background;
 
         animate background, border-color { duration: 150ms; }
-
-        // 上缘高光带（光泽面）：仅 Aero 主题显示；按下时压暗，模拟 XP 按钮的被按下状态
-        Rectangle {
-            visible: FluentPalette.is-aero;
-            x: 1px;
-            y: 1px;
-            width: parent.width - 2px;
-            height: 46%;
-            background: @linear-gradient(180deg, #FFFFFFD9 0%, #FFFFFF2E 100%);
-            opacity: root.pressed ? 0.35 : 0.9;
-            animate opacity { duration: 150ms; }
-        }
 
         i-border := Rectangle {
             border-radius: parent.border-radius;

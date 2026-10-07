@@ -57,7 +57,8 @@ export component LineEdit {
     vertical-stretch: 0;
     horizontal-stretch: 1;
     min-width: max(160px, layout.min-width);
-    min-height: max(32px, layout.min-height);
+    // 原样式 32px，为更紧凑的行距压到 28px。
+    min-height: max(28px, layout.min-height);
     forward-focus: base;
 
     states [

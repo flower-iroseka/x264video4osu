@@ -1,0 +1,15 @@
+import { Palette } from "std-widgets.slint";
+
+// 三个对话框共用的窗口外壳。窗口本身的行为（居中、模态、图标）在 Rust 侧的
+// win_dialog 模块里，这里只管 Slint 这一层的公共部分。
+//
+// 标题没放进来：Slint 只把「导出组件自己声明的属性」暴露给 Rust，基类组件声明的
+// 属性拿不到（生成的 set_dialog_title 不会有），所以 dialog-title 只能各自声明。
+export component DialogWindow inherits Window {
+    /// 消息框是白底，其余用主题背景色
+    in-out property <brush> dialog-background: Palette.background;
+
+    background: root.dialog-background;
+
+    @children
+}

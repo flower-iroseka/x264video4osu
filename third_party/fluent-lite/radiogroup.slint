@@ -1,14 +1,15 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-import { FluentPalette } from "styling.slint";
+import { FluentMetrics, FluentPalette } from "styling.slint";
 import { RadioButtonImplBase, RadioGroupImplBase } from "../common/radiogroup-base.slint";
 import { FocusBorder } from "components.slint";
 
 export component RadioButtonImpl inherits RadioButtonImplBase {
     private property <color> text-color: FluentPalette.foreground;
 
-    min-height: max(32px, layout.min-height);
+    // 原样式 32px，与其它控件一起压到 28px。
+    min-height: max(28px, layout.min-height);
 
     states [
         disabled when !root.enabled || !root.group-enabled: {
@@ -21,41 +22,56 @@ export component RadioButtonImpl inherits RadioButtonImplBase {
             outer.background: transparent;
             inner.border-color: root.checked ? FluentPalette.tertiary-accent-background : FluentPalette.control-alt-quaternary;
             outer.border-color: root.checked ? transparent : FluentPalette.control-strong-stroke-disabled;
-            inner.border-width: root.checked ? 7px : 5px;
+            inner.border-width: root.checked ? 5px : 3px;
         }
         hover when root.has-hover: {
             outer.background: root.checked ? transparent : FluentPalette.control-alt-tertiary;
-            inner.border-width: root.checked ? 5px : 0px;
+            inner.border-width: root.checked ? 3px : 0px;
         }
     ]
 
     animate text-color { duration: 200ms; }
 
     layout := HorizontalLayout {
-        padding: 6px;
+        // 原样式是 padding: 4px。这圈内边距会让圆点比同一列上的输入框/下拉框
+        // 右移 4px，还会把整行撑宽，所以去掉——圆点直接对齐控件列。
         spacing: 8px;
 
-        outer := Rectangle {
-            width: 20px;
+        // 布局只管 x，圆自己定位才吸附得了整数设备像素，所以套一层等大的透明占位。
+        circle-slot := Rectangle {
+            width: 13px;
             height: self.width;
             y: (parent.height - self.height) / 2;
-            // Aero：微妙玻璃渐变；默认主题：经典平面 control-alt-secondary
-            background: root.checked ? transparent : (FluentPalette.is-aero ? @linear-gradient(180deg, #FFFFFF 0%, #DDEFFA 100%) : FluentPalette.control-alt-secondary);
-            border-radius: self.width / 2;
-            border-width: 1px;
-            border-color: FluentPalette.control-strong-stroke;
+            background: transparent;
 
-            animate background, border-color { duration: 150ms; }
-
-            inner := Rectangle {
-                width: parent.width;
+            outer := Rectangle {
+                // 和复选框同理：边长和位置对齐到整数设备像素，否则 1px 的圆环会被
+                // 抗锯齿摊开、看着发虚（见 FluentMetrics）。
+                width: round(13px / FluentMetrics.device-pixel) * FluentMetrics.device-pixel;
                 height: self.width;
+                x: FluentMetrics.snap(circle-slot.absolute-position.x) - circle-slot.absolute-position.x;
+                // 再往下挪一个设备像素：汉字的墨迹本来就比行框中心低一点，
+                // 只按行框中点摆的话圆看起来会偏上（实测差 1 个设备像素）。
+                y: FluentMetrics.snap(circle-slot.absolute-position.y + (circle-slot.height - self.height) / 2)
+                    + FluentMetrics.device-pixel - circle-slot.absolute-position.y;
+                background: root.checked ? transparent : FluentPalette.control-alt-secondary;
                 border-radius: self.width / 2;
-                background: root.checked ? FluentPalette.state-secondary : transparent;
-                border-width: 6px;
-                border-color: root.checked ? FluentPalette.accent-background : transparent;
+                // 按设备像素算，否则 125% 下这条圆环会有 0.25 像素落到相邻像素上
+                border-width: FluentMetrics.device-pixel;
+                border-color: FluentPalette.control-strong-stroke;
 
-                animate border-width { duration: 150ms; }
+                animate background, border-color { duration: 150ms; }
+
+                inner := Rectangle {
+                    width: parent.width;
+                    height: self.width;
+                    border-radius: self.width / 2;
+                    background: root.checked ? FluentPalette.state-secondary : transparent;
+                    border-width: 4px;
+                    border-color: root.checked ? FluentPalette.accent-background : transparent;
+
+                    animate border-width { duration: 150ms; }
+                }
             }
         }
 

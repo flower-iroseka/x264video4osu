@@ -191,6 +191,10 @@ impl<B: GraphicsBackend> FemtoVGRenderer<B> {
         // fringe=0.5px，小图形（单选钮/复选框）边界锯齿明显。文本字号是物理的，
         // dpi=1.0 时字形按原生密度栅格化，尺寸不变且为整数 dpi（满足 femtovg 文本
         // 渲染对整数 device pixel ratio 的要求）。
+        //
+        // 试过把 dpi 调小（羽化带加宽到 1.5 设备像素）来柔化小圆的边缘，结果 1px
+        // 的描边会走到 femtovg 的 hairline 分支（line_width < fringe_width 时按比例
+        // 降透明度），细边框和细圆环直接被冲淡成浅灰，比原来更糟。1.0 是正确值。
         let scale = 1.0;
 
         window_inner

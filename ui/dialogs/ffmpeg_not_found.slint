@@ -1,59 +1,32 @@
-import { Button, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
-import { AeroTitleBar } from "../aero-title-bar.slint";
-import { FluentPalette } from "styling.slint";
+import { Button, VerticalBox } from "std-widgets.slint";
+import { DialogWindow } from "dialog-base.slint";
 
-export component FfmpegNotFoundDialog inherits Window {
-    title: root.dialog-title;
-    // 主题：theme-index 0 = 默认主题（系统原生标题栏），1 = Aero（自绘玻璃标题栏）
-    no-frame: root.theme-index == 1;
+export component FfmpegNotFoundDialog inherits DialogWindow {
     width: 460px;
-    height: root.theme-index == 1 ? 252px : 220px;
-    background: Palette.background;
+    height: 220px;
+    title: root.dialog-title;
 
-    in-out property <int> theme-index: 0;
+    /// 窗口的逻辑尺寸。Rust 侧要在窗口创建**之前**算出摆在哪，那会儿
+    /// `Window::size()` 还是 0，得从这个绑定读。
+    out property <length> dialog-w: root.width;
+    out property <length> dialog-h: root.height;
+
     in property <string> dialog-title;
     in property <string> message;
     in property <string> download-text;
     in property <string> exit-text;
 
-    in property <string> titlebar-tooltip-minimize;
-    in property <string> titlebar-tooltip-maximize;
-    in property <string> titlebar-tooltip-close;
-
     callback download();
     callback exit-dialog();
-    callback title-bar-drag();
-    callback title-bar-minimize();
-    callback title-bar-close();
-
-    // 把主题索引写入 FluentPalette 全局（驱动所有控件换肤）。FluentPalette 来自
-    // 导入文件，不生成 Rust 访问器，只能靠这个 public 函数从 Rust 端 invoke 同步设置。
-    public function apply-theme(t: int) {
-        FluentPalette.is-aero = t == 1;
-        root.theme-index = t;
-    }
 
     base := Rectangle {
         width: parent.width;
         height: parent.height;
 
-        // ---- Frutiger Aero 标题栏（仅 Aero 主题） ----
-        if root.theme-index == 1 : AeroTitleBar {
-            window-title: root.dialog-title;
-            tooltip-minimize: root.titlebar-tooltip-minimize;
-            tooltip-maximize: root.titlebar-tooltip-maximize;
-            tooltip-close: root.titlebar-tooltip-close;
-            width: parent.width;
-            y: 0;
-            drag-pressed => { root.title-bar-drag(); }
-            minimize => { root.title-bar-minimize(); }
-            close => { root.title-bar-close(); }
-        }
-
         VerticalBox {
-            y: root.theme-index == 1 ? 32px : 0px;
+            y: 0px;
             width: parent.width;
-            height: parent.height - (root.theme-index == 1 ? 32px : 0px);
+            height: parent.height;
             padding: 20px;
             spacing: 16px;
 
@@ -62,7 +35,7 @@ export component FfmpegNotFoundDialog inherits Window {
                 wrap: word-wrap;
             }
             Rectangle { height: 0px; vertical-stretch: 1; }
-            HorizontalBox {
+            HorizontalLayout {
                 alignment: end;
                 spacing: 12px;
                 Button {

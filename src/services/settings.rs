@@ -1,59 +1,38 @@
-//! 应用设置持久化：主题与语言选择保存到 `%APPDATA%\x264video4osu\settings.ini`。
+//! 应用设置持久化：界面语言保存到 `%APPDATA%\x264video4osu\settings.ini`。
 //!
-//! 格式为简单的 `key=value` 两行（与旧程序 Settings 的扁平 INI 风格一致）：
+//! 格式为简单的 `key=value` 单行（与旧程序 Settings 的扁平 INI 风格一致）：
 //!
 //! ```ini
 //! lang=0
-//! theme=1
 //! ```
 //!
 //! 解析时对非法值静默忽略（回落到默认），写入时 best-effort 忽略 IO 错误，
-//! 设置文件损坏/缺失不会影响程序启动。
+//! 设置文件损坏/缺失不会影响程序启动。旧版本写过的 `theme=` 行会被忽略。
 
 use std::fs;
 use std::path::PathBuf;
 
-/// 主题枚举。索引即设置文件里存的值，也即 Slint 侧 `theme-index`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Theme {
-    /// 默认主题（老主题）：`#FAFAFA` 白底、`#0078D4` 蓝、系统原生标题栏
-    Default = 0,
-    /// Aero 主题：天蓝天空渐变底、aqua 主色、自绘玻璃标题栏
-    Aero = 1,
-}
+/// 界面语言一共几种（0=中文，1=English）。
+const LANG_COUNT: i32 = 2;
 
-impl Theme {
-    pub fn is_aero(self) -> bool {
-        self == Theme::Aero
-    }
-
-    pub fn from_index(i: i32) -> Theme {
-        match i {
-            1 => Theme::Aero,
-            _ => Theme::Default,
-        }
-    }
+/// 把语言编号夹回有效范围。
+///
+/// 文件里的值不受程序控制：可能被手改过，可能写坏了，也可能来自以后加了
+/// 第三门语言的版本。不夹的话，这个数字会直接传给界面上的语言下拉框当
+/// 「选中第几项」，项不存在时下拉框就显示成空白。
+fn clamp_lang_index(v: i32) -> i32 {
+    v.clamp(0, LANG_COUNT - 1)
 }
 
 /// 应用设置。`lang_index` 对应 i18n::Lang（0=中文，1=English）。
 #[derive(Debug, Clone, Copy)]
 pub struct AppSettings {
     pub lang_index: i32,
-    pub theme_index: i32,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
-        AppSettings {
-            lang_index: 0,
-            theme_index: 0, // 首次运行默认主题（老主题）
-        }
-    }
-}
-
-impl AppSettings {
-    pub fn theme(&self) -> Theme {
-        Theme::from_index(self.theme_index)
+        AppSettings { lang_index: 0 }
     }
 }
 
@@ -85,12 +64,7 @@ pub fn load() -> AppSettings {
             match key.trim() {
                 "lang" => {
                     if let Ok(v) = value.trim().parse::<i32>() {
-                        settings.lang_index = v;
-                    }
-                }
-                "theme" => {
-                    if let Ok(v) = value.trim().parse::<i32>() {
-                        settings.theme_index = v;
+                        settings.lang_index = clamp_lang_index(v);
                     }
                 }
                 _ => {}
@@ -107,8 +81,23 @@ pub fn save(settings: &AppSettings) {
         eprintln!("warning: failed to create settings dir {}: {e}", dir.display());
         return;
     }
-    let content = format!("lang={}\ntheme={}\n", settings.lang_index, settings.theme_index);
+    let content = format!("lang={}\n", settings.lang_index);
     if let Err(e) = fs::write(settings_path(), content) {
         eprintln!("warning: failed to save settings: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lang_index_is_clamped_to_known_languages() {
+        assert_eq!(clamp_lang_index(0), 0);
+        assert_eq!(clamp_lang_index(1), 1);
+        // 配置文件被手改成 5，或者从加了第三门语言的版本退回旧版
+        assert_eq!(clamp_lang_index(5), 1);
+        assert_eq!(clamp_lang_index(-3), 0);
+        assert_eq!(clamp_lang_index(i32::MAX), 1);
     }
 }
