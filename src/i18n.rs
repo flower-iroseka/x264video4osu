@@ -1,9 +1,9 @@
 //! UI 字符串（对应旧程序 `Resources/Strings.zh-CN.xaml` 与 `Strings.en-US.xaml`，
-//! 以及旧界面中硬编码的英文文案）。
+//! 以及旧界面中硬编码的文案）。
 //!
-//! 注意：旧程序中「Open Output Folder」按钮文案是硬编码英文，不随语言切换；
-//! 进度/结果文本（Pass / ETA / Elapsed / Output size）同样是硬编码英文，
-//! 因此这里两种语言下保持一致。
+//! 旧程序设计成不随语言切换的那几处文案（`Open Output Folder` 按钮、进度行的
+//! Pass / ETA / Elapsed、结果行的 Output size），3.2 起也一起翻了。日志页里的
+//! `[CONFIG]` `[START]` 这类行仍是英文：那是技术日志，按惯例不翻。
 //!
 //! 校验提示和错误提示旧程序也是写死的英文，这里补上了中文（见 `title_*` / `msg_*`）。
 //! 里面带 `{...}` 的是模板，由 app.rs 在运行时替换。
@@ -60,6 +60,14 @@ pub struct Strings {
     pub repeat_twice_text: String,
     /// 把秒数写成用户看得懂的长度：中文「2 分 55 秒」，英文「2:55」
     pub duration_text: fn(f64) -> String,
+    /// 进度行的三格。`{pass}` `{total}` `{time}` 由 app.rs 替换
+    pub progress_pass: String,
+    pub progress_eta: String,
+    pub progress_elapsed: String,
+    /// 编码结束后的结果行，`{size}` 是 MB 数
+    pub result_output_size: String,
+    /// 选择输入文件的原生对话框里的过滤项名称
+    pub dialog_filter_video: String,
 }
 
 fn zh_duration(secs: f64) -> String {
@@ -93,8 +101,7 @@ fn zh() -> Strings {
             check_auto_scroll: "自动滚动".into(),
             button_save_log: "保存日志".into(),
             button_about: "关于".into(),
-            // 旧程序硬编码英文，不随语言切换
-            button_open_folder: "Open Output Folder".into(),
+            button_open_folder: "打开输出文件夹".into(),
             // ---- 音频模式 ----
             label_audio_mode: "音频模式".into(),
             audio_none: "无音频".into(),
@@ -124,10 +131,28 @@ fn zh() -> Strings {
             tip_auto_scroll: "追加日志时自动滚动到底部".into(),
             tip_audio_mode: "输出视频中的音频处理方式".into(),
             tip_audio_codec: "转码音频时使用的编码器（FLAC 仅支持 mp4）".into(),
-            tip_trim: "勾选后可裁剪视频的起止范围".into(),
-            tip_trim_unit: "按帧号或按时间裁剪。按帧需要先读取源视频帧率".into(),
-            tip_trim_start: "起始位置：帧号，或 时:分:秒.毫秒".into(),
-            tip_trim_end: "结束位置：帧号，或 时:分:秒.毫秒".into(),
+            tip_trim: "裁剪视频的起止范围".into(),
+            // 提示只讲控件是什么，不讲界面会怎么反应（比如「改动后另一个框会跟着换算」）
+            tip_trim_unit: "按帧号或按时间裁剪".into(),
+            tip_trim_start: "裁剪起点".into(),
+            tip_trim_end: "裁剪终点".into(),
+            // ---- 视频预览 ----
+            tip_preview_expand: "展开视频预览".into(),
+            tip_preview_collapse: "收起视频预览".into(),
+            button_play: "播放".into(),
+            button_pause: "暂停".into(),
+            button_set_start: "设为开头".into(),
+            button_set_end: "设为结尾".into(),
+            button_jump: "跳转".into(),
+            tip_step_back: "后退一帧".into(),
+            tip_step_forward: "前进一帧".into(),
+            tip_goto_start: "跳到视频开头".into(),
+            tip_goto_end: "跳到视频结尾".into(),
+            tip_jump: "跳到输入框里的位置".into(),
+            tip_frame_input: "帧号".into(),
+            tip_time_input: "时间戳，格式 时:分:秒.毫秒".into(),
+            tip_set_start: "把预览的当前位置设为裁剪起点".into(),
+            tip_set_end: "把预览的当前位置设为裁剪终点".into(),
             tip_input_path: "输入视频文件路径".into(),
             tip_output_path: "输出视频文件路径".into(),
             tip_value: "数值：2pass 为目标码率（kbps），CRF 为质量（0-51）".into(),
@@ -171,6 +196,11 @@ fn zh() -> Strings {
         repeat_once_text: "忽略编辑列表".into(),
         repeat_twice_text: "保留编辑列表".into(),
         duration_text: zh_duration,
+        progress_pass: "第 {pass}/{total} 遍".into(),
+        progress_eta: "剩余 {time}".into(),
+        progress_elapsed: "已用 {time}".into(),
+        result_output_size: "输出大小：{size} MB".into(),
+        dialog_filter_video: "视频文件".into(),
     }
 }
 
@@ -225,10 +255,27 @@ fn en() -> Strings {
             tip_auto_scroll: "Scroll to the bottom automatically as new log lines are added".into(),
             tip_audio_mode: "How audio is handled in the output video".into(),
             tip_audio_codec: "Audio codec used when transcoding (FLAC is mp4-only)".into(),
-            tip_trim: "Check to trim the start/end range of the video".into(),
-            tip_trim_unit: "Trim by frame number or by time. Frames require reading the source frame rate".into(),
-            tip_trim_start: "Start position: frame number, or HH:MM:SS.mmm".into(),
-            tip_trim_end: "End position: frame number, or HH:MM:SS.mmm".into(),
+            tip_trim: "Trim the start/end range of the video".into(),
+            tip_trim_unit: "Trim by frame number or by time".into(),
+            tip_trim_start: "Trim start".into(),
+            tip_trim_end: "Trim end".into(),
+            // ---- 视频预览 ----
+            tip_preview_expand: "Expand the video preview".into(),
+            tip_preview_collapse: "Collapse the video preview".into(),
+            button_play: "Play".into(),
+            button_pause: "Pause".into(),
+            button_set_start: "Set as start".into(),
+            button_set_end: "Set as end".into(),
+            button_jump: "Go".into(),
+            tip_step_back: "Step back one frame".into(),
+            tip_step_forward: "Step forward one frame".into(),
+            tip_goto_start: "Jump to the start of the video".into(),
+            tip_goto_end: "Jump to the end of the video".into(),
+            tip_jump: "Jump to the typed position".into(),
+            tip_frame_input: "Frame number".into(),
+            tip_time_input: "Timestamp, HH:MM:SS.mmm".into(),
+            tip_set_start: "Use the current preview position as the trim start".into(),
+            tip_set_end: "Use the current preview position as the trim end".into(),
             tip_input_path: "Input video file path".into(),
             tip_output_path: "Output video file path".into(),
             tip_value: "Value: target bitrate (kbps) for 2pass, quality (0-51) for CRF".into(),
@@ -272,6 +319,11 @@ fn en() -> Strings {
         repeat_once_text: "Ignore edit list".into(),
         repeat_twice_text: "Keep edit list".into(),
         duration_text: en_duration,
+        progress_pass: "Pass {pass}/{total}".into(),
+        progress_eta: "ETA: {time}".into(),
+        progress_elapsed: "Elapsed: {time}".into(),
+        result_output_size: "Output size: {size} MB".into(),
+        dialog_filter_video: "Video Files".into(),
     }
 }
 

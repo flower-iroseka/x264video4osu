@@ -18,15 +18,18 @@ pub fn tools_folder() -> PathBuf {
     exe_dir().join("tools")
 }
 
-/// 优先 `<exe>/tools/<exeName>`，其次相对 cwd 的 `tools/<exeName>`，
+/// 优先 `<exe>/tools/<name>`，其次相对 cwd 的 `tools/<name>`，
 /// 都不存在时返回前者（由调用者检查）。对应 `GetToolPath`。
-fn get_tool_path(exe_name: &str) -> PathBuf {
-    let primary = exe_dir().join("tools").join(exe_name);
+///
+/// 预览用的 `libmpv-2.dll` 也走这套查找（见 `services::preview`），
+/// 所以这里不限定扩展名、也不限定必须是 exe。
+pub(crate) fn tool_path(name: &str) -> PathBuf {
+    let primary = exe_dir().join("tools").join(name);
     if primary.exists() {
         return primary;
     }
 
-    let relative = PathBuf::from("tools").join(exe_name);
+    let relative = PathBuf::from("tools").join(name);
     if relative.exists() {
         return relative;
     }
@@ -35,11 +38,11 @@ fn get_tool_path(exe_name: &str) -> PathBuf {
 }
 
 pub fn ffmpeg_path() -> PathBuf {
-    get_tool_path("ffmpeg.exe")
+    tool_path("ffmpeg.exe")
 }
 
 pub fn ffprobe_path() -> PathBuf {
-    get_tool_path("ffprobe.exe")
+    tool_path("ffprobe.exe")
 }
 
 pub fn download_url() -> &'static str {

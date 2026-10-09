@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 跳到视频结尾。三角尖朝右，竖条在右。 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14">
+  <path d="M1.4 2 L1.4 12 L8.8 7 Z" fill="#000000"/>
+  <rect x="10.6" y="2" width="2.4" height="10" fill="#000000"/>
+</svg>

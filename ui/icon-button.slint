@@ -1,0 +1,67 @@
+// Media Player Classic 那种方形图标按钮：正方形、只有图标、没有文字。
+//
+// 不用 fluent-lite 的 Button：它有 icon 属性，但内部 i-layout 左右各 12px 内边距、
+// min-width 32px，图标放进去会被撑成长条，做不出方形。所以这里自己拼一个，
+// 配色沿用 FluentPalette 的同一套 state 色，看起来和其它按钮是一家的。
+
+import { FluentPalette } from "fluent-lite/styling.slint";
+
+export component IconButton {
+    in property <image> icon;
+    // 单向：下面的 TouchArea 读它。写成双向会绕成一个环。
+    in property <bool> enabled: true;
+    in property <string> tooltip-text: "";
+    callback clicked;
+
+    // 和输入框、下拉框压到同一高度（28px），一行里不会高出一截
+    width: 28px;
+    height: 28px;
+
+    i-bg := Rectangle {
+        border-radius: 4px;
+        // 从下往上判：禁用 > 按下 > 悬停 > 常态
+        background: !root.enabled ? FluentPalette.control-disabled
+            : i-touch.pressed ? FluentPalette.control-tertiary
+            : i-touch.has-hover ? FluentPalette.control-secondary
+            : FluentPalette.control-background;
+        border-width: 1px;
+        border-color: root.enabled ? FluentPalette.control-border : transparent;
+
+        animate background, border-color { duration: 150ms; }
+    }
+
+    Image {
+        width: 14px;
+        height: 14px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        source: root.icon;
+        colorize: root.enabled ? FluentPalette.control-foreground : FluentPalette.text-disabled;
+    }
+
+    i-touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    // 必须排在 TouchArea 后面（更上层），TooltipArea 才收得到鼠标事件
+    if (root.tooltip-text != ""): Tooltip {
+        Rectangle {
+            background: FluentPalette.alternate-background;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: FluentPalette.border;
+            VerticalLayout {
+                padding-left: 9px;
+                padding-right: 9px;
+                padding-top: 6px;
+                padding-bottom: 6px;
+                Text {
+                    text: root.tooltip-text;
+                    font-size: 12px;
+                    color: FluentPalette.foreground;
+                }
+            }
+        }
+    }
+}

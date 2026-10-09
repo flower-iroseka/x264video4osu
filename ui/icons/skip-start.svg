@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 跳到视频开头。竖条在左，三角尖朝左。颜色由 Slint 的 Image.colorize 覆盖。 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14">
+  <rect x="1" y="2" width="2.4" height="10" fill="#000000"/>
+  <path d="M12.6 2 L12.6 12 L5.2 7 Z" fill="#000000"/>
+</svg>

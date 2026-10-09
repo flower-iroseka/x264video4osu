@@ -13,6 +13,7 @@ use crate::services::ffmpeg::{
 };
 use crate::services::format::OutputFormat;
 use crate::services::pathutil::{full_path, validate_path};
+use crate::services::preview::{self, Preview};
 use crate::services::settings::{self, AppSettings};
 use crate::services::trim;
 use slint::{ComponentHandle, SharedString, Timer, TimerMode, VecModel};
@@ -32,6 +33,15 @@ struct RepeatDecision {
     ignore_editlist: bool,
 }
 
+/// 进度行三格文字要用到的数（百分比单独一格，不在这里）。
+#[derive(Clone, Copy)]
+struct ProgressSnapshot {
+    pass_index: u32,
+    pass_count: u32,
+    remaining_secs: f64,
+    elapsed_secs: f64,
+}
+
 pub struct AppController {
     ui: crate::MainWindow,
     service: FfmpegService,
@@ -41,6 +51,12 @@ pub struct AppController {
     /// 逐行日志模型（日志页 ListView 显示用；与 log_buffer 同内容，仅按换行拆分）
     log_lines_model: Rc<VecModel<SharedString>>,
     last_output_path: Option<std::path::PathBuf>,
+    /// 上次编码产物的字节数。结果行那串文字是编码结束时算好写进去的，
+    /// 之后切语言不会自己重算，所以把字节数留着，切语言时重新拼一遍。
+    last_output_bytes: Option<u64>,
+    /// 上一次进度事件的那几个数。进度行是常驻显示的，编码结束后不再来事件，
+    /// 那串「第 x/y 遍 / 剩余 / 已用」就停在结束时的语言里，切语言时按这份值重拼。
+    last_progress: Option<ProgressSnapshot>,
     /// 2pass 临时日志的绝对路径基名（ffmpeg 自己加的 `-0` 后缀不含在内）。
     /// 停止或关窗时按它清理 —— 文件落在应用当前目录，不是输出目录旁边。
     current_log_path: Option<std::path::PathBuf>,
@@ -64,6 +80,18 @@ pub struct AppController {
     poll_timer: Timer,
     /// 自动滚动去抖标志
     scroll_pending: Rc<Cell<bool>>,
+    /// 预览会话。None = 没有 libmpv / 还没起 / 起不来，此时预览入口整体禁用。
+    preview: Option<Preview>,
+    /// mpv 落脚用的子窗口句柄。0 表示还没建。
+    preview_host: isize,
+    /// 预览最近一次打开的输入文件，用来判断要不要重新 load
+    preview_opened: Option<String>,
+    /// 当前预览文件的帧率。0 = 探不出来，此时帧号相关的控件禁用。
+    /// 和按帧裁剪用的是同一次 ffprobe 结果，两边帧号必须一致。
+    preview_fps: f64,
+    /// 正在把换算结果写回另一个输入框。程序写 text 理论上不会触发 edited，
+    /// 但两个框互相写，一旦触发就是死循环，加个闸保险。
+    preview_syncing: bool,
 }
 
 impl AppController {
@@ -90,6 +118,8 @@ impl AppController {
             log_buffer: String::new(),
             log_lines_model: Rc::new(VecModel::default()),
             last_output_path: None,
+            last_output_bytes: None,
+            last_progress: None,
             current_log_path: None,
             mode_index: 0,
             trim_unit_index: 0,
@@ -101,6 +131,11 @@ impl AppController {
             settings,
             poll_timer: Timer::default(),
             scroll_pending: Rc::new(Cell::new(false)),
+            preview: None,
+            preview_host: 0,
+            preview_opened: None,
+            preview_fps: 0.0,
+            preview_syncing: false,
         }));
         // 弱引用要等 Rc 建好才能取，所以放在构造之后补上
         controller.borrow_mut().self_weak = Rc::downgrade(&controller);
@@ -120,6 +155,9 @@ impl AppController {
         // 这里只同步界面文本。
         ui.set_language_index(rc.settings.lang_index);
         ui.set_strings(rc.strings.ui.clone());
+        // 预览按钮先藏起来，等确认 libmpv 可用、子窗口建出来了再放出来，
+        // 免得闪一下又消失。
+        ui.set_preview_available(false);
 
         // ---- 按钮回调 ----
         let w = weak.clone();
@@ -206,6 +244,85 @@ impl AppController {
             }
         });
 
+        // ---- 预览面板 ----
+        let w = weak.clone();
+        ui.on_preview_toggle_expanded(move || {
+            if let Some(c) = w.upgrade() {
+                c.borrow_mut().toggle_preview_expanded();
+            }
+        });
+        let w = weak.clone();
+        ui.on_preview_toggle_play(move || {
+            if let Some(c) = w.upgrade() {
+                let c = c.borrow();
+                if let Some(p) = &c.preview {
+                    p.set_paused(!p.state().paused);
+                }
+            }
+        });
+        let w = weak.clone();
+        ui.on_preview_step(move |n: i32| {
+            if let Some(c) = w.upgrade() {
+                if let Some(p) = &c.borrow().preview {
+                    p.step_frames(n as i64);
+                }
+            }
+        });
+        let w = weak.clone();
+        ui.on_preview_seek(move |ratio: f32| {
+            if let Some(c) = w.upgrade() {
+                let c = c.borrow();
+                if let Some(p) = &c.preview {
+                    let dur = p.state().duration;
+                    if dur > 0.0 {
+                        p.seek((ratio as f64 * dur).clamp(0.0, dur));
+                    }
+                }
+            }
+        });
+        let w = weak.clone();
+        ui.on_preview_goto_start(move || {
+            if let Some(c) = w.upgrade() {
+                c.borrow_mut().preview_goto(true);
+            }
+        });
+        let w = weak.clone();
+        ui.on_preview_goto_end(move || {
+            if let Some(c) = w.upgrade() {
+                c.borrow_mut().preview_goto(false);
+            }
+        });
+        let w = weak.clone();
+        ui.on_preview_frame_edited(move |text: SharedString| {
+            if let Some(c) = w.upgrade() {
+                c.borrow_mut().preview_frame_edited(&text);
+            }
+        });
+        let w = weak.clone();
+        ui.on_preview_time_edited(move |text: SharedString| {
+            if let Some(c) = w.upgrade() {
+                c.borrow_mut().preview_time_edited(&text);
+            }
+        });
+        let w = weak.clone();
+        ui.on_preview_jump_to_input(move || {
+            if let Some(c) = w.upgrade() {
+                c.borrow_mut().preview_jump_to_input();
+            }
+        });
+        let w = weak.clone();
+        ui.on_preview_set_trim_start(move || {
+            if let Some(c) = w.upgrade() {
+                c.borrow_mut().preview_set_trim(true);
+            }
+        });
+        let w = weak.clone();
+        ui.on_preview_set_trim_end(move || {
+            if let Some(c) = w.upgrade() {
+                c.borrow_mut().preview_set_trim(false);
+            }
+        });
+
         // ---- 关窗清理 ----
         let w = weak.clone();
         let window = ui.window();
@@ -231,6 +348,7 @@ impl AppController {
                 let mut c = c.borrow_mut();
                 c.drain_events();
                 apply_window_size(&c.ui);
+                c.sync_preview();
             }
         });
         self_rc.borrow_mut().poll_timer = timer;
@@ -245,6 +363,10 @@ impl AppController {
                 crate::win_icon::apply_window_icon(hwnd);
             }
         });
+
+        // ---- 预览 ----
+        // 比图标再晚一点：那会儿窗口一定建出来了，子窗口才有地方挂。
+        Self::setup_preview(self_rc);
     }
 
     // =============================================================
@@ -260,7 +382,8 @@ impl AppController {
     fn handle_browse_output(&mut self) {
         let format = OutputFormat::from_index(self.ui.get_format_index());
         let ext = format.extension().trim_start_matches('.');
-        let dialog = rfd::FileDialog::new().add_filter("Video Files", &["mp4", "flv", "avi"]);
+        let dialog = rfd::FileDialog::new()
+            .add_filter(&self.strings.dialog_filter_video, &["mp4", "flv", "avi"]);
         if let Some(mut path) = dialog.save_file() {
             // 对应旧程序 SaveFileDialog.DefaultExt：用户未输入扩展名时补全
             if path.extension().is_none() {
@@ -548,6 +671,14 @@ impl AppController {
         let lang = if index == 0 { Lang::Zh } else { Lang::En };
         self.strings = i18n::for_lang(lang);
         self.ui.set_strings(self.strings.ui.clone());
+        // 结果行是编码结束时算好写进去的，语言换了得按新语言重拼一遍
+        if let Some(bytes) = self.last_output_bytes {
+            self.ui.set_output_size_text(self.result_size_text(bytes));
+        }
+        // 进度行常驻显示，编完之后不再来事件，也停在旧语言里，同样要重拼
+        if let Some(p) = self.last_progress {
+            self.apply_progress_texts(p);
+        }
         // 中英文的窗口宽度和标签列宽度不同，切语言后按新尺寸重设窗口
         apply_window_size(&self.ui);
         // 持久化语言选择（语言框索引已通过 <=> 同步到 UI，这里只需保存）
@@ -566,7 +697,301 @@ impl AppController {
     fn handle_trim_unit_changed(&mut self, text: String) {
         // Slint 侧 RadioButton 的 text 既是显示文本又是回传值，没有独立的值字段，
         // 所以这里拿当前语言的「时间」文案比对；不等于它就按「帧」处理。
-        self.trim_unit_index = if text == self.strings.ui.trim_time.as_str() { 1 } else { 0 };
+        let new_index = if text == self.strings.ui.trim_time.as_str() { 1 } else { 0 };
+        // 点已经选中的那一项时 selected 也会来一次，不挡住会把值换算两遍变回去
+        if new_index == self.trim_unit_index {
+            return;
+        }
+        self.trim_unit_index = new_index;
+
+        let start = self.ui.get_trim_start_text().to_string();
+        let end = self.ui.get_trim_end_text().to_string();
+        // 两个框都空着就没什么可换的，也别为它白跑一次 ffprobe
+        if start.trim().is_empty() && end.trim().is_empty() {
+            return;
+        }
+        // 两边换算都要帧率（帧 → 秒），拿不到就原样留着，
+        // 和按帧编码时会报 msg_no_fps 的口径一致
+        let fps = match self.probe_fps_for_trim() {
+            Some(fps) => fps,
+            None => return,
+        };
+        let to_frames = self.trim_unit_index == 0;
+        self.ui
+            .set_trim_start_text(trim::convert_unit_text(&start, to_frames, fps).into());
+        self.ui
+            .set_trim_end_text(trim::convert_unit_text(&end, to_frames, fps).into());
+    }
+
+    // =============================================================
+    // 视频预览
+    // =============================================================
+
+    /// 等窗口真的建出来，再建子窗口、起 mpv。失败就把预览入口整体藏掉。
+    fn setup_preview(self_rc: &Rc<RefCell<Self>>) {
+        let w = Rc::downgrade(self_rc);
+        slint::Timer::single_shot(Duration::from_millis(250), move || {
+            let Some(c) = w.upgrade() else { return };
+            let mut c = c.borrow_mut();
+
+            if !preview::is_available() {
+                // 没有 libmpv-2.dll。预览是可选功能，不影响其它部分。
+                c.ui.set_preview_available(false);
+                return;
+            }
+
+            let main = crate::win_icon::main_window_hwnd(c.ui.window());
+            let host = if main.is_null() {
+                std::ptr::null_mut()
+            } else {
+                crate::platform::preview_window::create(main)
+            };
+            if host.is_null() {
+                c.ui.set_preview_available(false);
+                return;
+            }
+
+            match Preview::new(host) {
+                Ok(p) => {
+                    c.preview_host = host as isize;
+                    c.preview = Some(p);
+                    // 预览一律从收起开始，不记上次的状态：窗口默认保持原来的窄宽度，
+                    // 要用预览再点侧边的展开按钮。
+                    c.ui.set_preview_expanded(false);
+                    c.ui.set_preview_available(true);
+                    apply_window_size(&c.ui);
+                    c.reload_preview_source();
+                }
+                Err(e) => {
+                    // 起不来就彻底关掉入口，别让用户点开一个空面板
+                    eprintln!("preview unavailable: {e}");
+                    crate::platform::preview_window::destroy(host);
+                    c.ui.set_preview_available(false);
+                }
+            }
+        });
+    }
+
+    /// 展开/收起预览。窗口宽度跟着变，立刻应用一次免得等 100ms 的轮询。
+    /// 展开状态不写进设置：下次启动还是收起的。
+    fn toggle_preview_expanded(&mut self) {
+        let expanded = !self.ui.get_preview_expanded();
+        self.ui.set_preview_expanded(expanded);
+        apply_window_size(&self.ui);
+        self.sync_preview();
+    }
+
+    /// 把预览的当前状态搬到界面上，并顺手摆好 mpv 的子窗口。
+    /// 由 100ms 的轮询定时器调用。
+    fn sync_preview(&mut self) {
+        if self.preview.is_none() {
+            return;
+        }
+        // 输入框里换了文件就跟着换（内部会先比对，没变就直接返回）
+        self.reload_preview_source();
+
+        let Some(p) = &self.preview else { return };
+        let st = p.state();
+
+        // 画面区的位置随窗口尺寸/DPI/展开状态变，每轮都摆一次。SetWindowPos 很便宜。
+        let host = self.preview_host as windows_sys::Win32::Foundation::HWND;
+        if !host.is_null() {
+            let expanded = self.ui.get_preview_expanded();
+            if !expanded {
+                crate::platform::preview_window::set_visible(host, false);
+            } else {
+                let sf = self.ui.window().scale_factor() as f32;
+                let vx = self.ui.get_video_x() as f32;
+                let vy = self.ui.get_video_y() as f32;
+                let vw = self.ui.get_video_w() as f32;
+                let vh = self.ui.get_video_h() as f32;
+                // Slint 画那块矩形时，边界铺满它跨到的整格设备像素（左边 floor、
+                // 右边 ceil）。子窗口得用同一套算法，不然 125% 缩放下两边差出半格，
+                // 黑底占位矩形会在画面左边露出一条黑边（右边不会，方向反着）。
+                let x = (vx * sf).floor() as i32;
+                let y = (vy * sf).floor() as i32;
+                let w = ((vx + vw) * sf).ceil() as i32 - x;
+                let h = ((vy + vh) * sf).ceil() as i32 - y;
+                crate::platform::preview_window::place(host, x, y, w, h);
+                crate::platform::preview_window::set_visible(host, true);
+            }
+        }
+
+        self.ui.set_preview_loaded(st.loaded);
+        self.ui.set_preview_paused(st.paused);
+        self.ui
+            .set_preview_time_text(trim::format_timecode(st.time_pos).into());
+        self.ui
+            .set_preview_duration_text(trim::format_timecode(st.duration).into());
+        // 帧号要和按帧裁剪用同一套算法，都用 trim 里那两个换算函数
+        if st.loaded && self.preview_fps > 0.0 {
+            self.ui
+                .set_preview_frame_cur(trim::secs_to_frame(st.time_pos, self.preview_fps).to_string().into());
+            self.ui.set_preview_frame_total(
+                trim::secs_to_frame(st.duration, self.preview_fps).to_string().into(),
+            );
+        } else {
+            self.ui.set_preview_frame_cur("--".into());
+            self.ui.set_preview_frame_total("--".into());
+        }
+        // 用户正在拖进度条时别覆盖他手上的值
+        if !self.ui.get_preview_scrubbing() {
+            self.ui.set_preview_seek_1000((st.progress() * 1000.0) as f32);
+        }
+    }
+
+    /// 输入文件变了就把新文件塞给 mpv。没变则什么都不做。
+    fn reload_preview_source(&mut self) {
+        let Some(p) = &self.preview else { return };
+        let path = self.ui.get_input_path().to_string();
+        if path.trim().is_empty() || self.preview_opened.as_deref() == Some(path.as_str()) {
+            return;
+        }
+        if !Path::new(&path).exists() {
+            return;
+        }
+        p.set_paused(true);
+        p.open(Path::new(&path));
+        self.preview_opened = Some(path);
+        // 帧号换算要帧率。和按帧裁剪走同一条 ffprobe，别另起一套，
+        // 否则「当前帧为开头」填进去的帧号和编码时算的对不上。
+        self.preview_fps = self.probe_fps_for_trim().unwrap_or(0.0);
+        self.ui.set_preview_fps_known(self.preview_fps > 0.0);
+        // 预览面板按真实宽高比摆画面。上一次探测的结果里带着宽高，不用再跑一遍 ffprobe；
+        // 探不到（比如 ffprobe 只给了部分字段）就按 16:9 摆。
+        let aspect = match &self.last_probe {
+            Some(info) if info.width > 0 && info.height > 0 => {
+                info.width as f32 / info.height as f32
+            }
+            _ => 16.0 / 9.0,
+        };
+        self.ui.set_video_aspect(aspect);
+        // 换文件了，输入框回到起点
+        self.set_preview_inputs(0.0);
+    }
+
+    /// 把帧号框和时间戳框一起设成指定的秒数，中间不会触发互相换算。
+    fn set_preview_inputs(&mut self, secs: f64) {
+        let secs = secs.max(0.0);
+        self.preview_syncing = true;
+        self.ui
+            .set_preview_time_input(trim::format_timecode(secs).into());
+        self.ui.set_preview_frame_input(
+            if self.preview_fps > 0.0 {
+                trim::secs_to_frame(secs, self.preview_fps).to_string()
+            } else {
+                "0".to_string()
+            }
+            .into(),
+        );
+        self.preview_syncing = false;
+    }
+
+    /// 用户改了帧号框：把对应的时间戳算出来填进另一个框。
+    fn preview_frame_edited(&mut self, text: &str) {
+        if self.preview_syncing || self.preview_fps <= 0.0 {
+            return;
+        }
+        // 打字过程中会经过 "1"、"12" 这种半截状态，解析不了就什么都不做，
+        // 别弹框也别把另一个框清空
+        let Ok(frame) = text.trim().parse::<i64>() else {
+            return;
+        };
+        if frame < 0 {
+            return;
+        }
+        let secs = trim::frame_to_secs(frame, self.preview_fps);
+        self.preview_syncing = true;
+        self.ui
+            .set_preview_time_input(trim::format_timecode(secs).into());
+        self.preview_syncing = false;
+    }
+
+    /// 用户改了时间戳框：把对应的帧号算出来填进另一个框。
+    fn preview_time_edited(&mut self, text: &str) {
+        if self.preview_syncing {
+            return;
+        }
+        let Some(secs) = trim::parse_timecode(text) else {
+            return;
+        };
+        if self.preview_fps <= 0.0 {
+            return;
+        }
+        let frame = trim::secs_to_frame(secs, self.preview_fps);
+        self.preview_syncing = true;
+        self.ui
+            .set_preview_frame_input(frame.to_string().into());
+        self.preview_syncing = false;
+    }
+
+    /// 跳到输入框指定的位置。时间戳优先，读不出来再用帧号。
+    fn preview_jump_to_input(&mut self) {
+        let Some(p) = &self.preview else { return };
+        let time_text = self.ui.get_preview_time_input().to_string();
+        let frame_text = self.ui.get_preview_frame_input().to_string();
+        let secs = trim::parse_timecode(&time_text).or_else(|| {
+            frame_text
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .filter(|_| self.preview_fps > 0.0)
+                .map(|f| trim::frame_to_secs(f, self.preview_fps))
+        });
+        let Some(secs) = secs else { return };
+        let dur = p.state().duration;
+        let target = if dur > 0.0 { secs.clamp(0.0, dur) } else { secs.max(0.0) };
+        p.set_paused(true);
+        p.seek(target);
+    }
+
+    /// 跳到视频开头 / 结尾。
+    fn preview_goto(&mut self, to_start: bool) {
+        let Some(p) = &self.preview else { return };
+        let target = if to_start {
+            0.0
+        } else {
+            (p.state().duration - 1.0 / self.preview_fps.max(1.0)).max(0.0)
+        };
+        p.set_paused(true);
+        p.seek(target);
+    }
+
+    /// 把预览的当前位置写进裁剪的起点或终点输入框。
+    fn preview_set_trim(&mut self, is_start: bool) {
+        let Some(p) = &self.preview else { return };
+        let secs = p.state().time_pos;
+        let text = if self.trim_unit_index == 0 {
+            // 按帧：要帧率，拿不到就不动，免得填一个错的帧号进去
+            if self.preview_fps <= 0.0 {
+                return;
+            }
+            trim::secs_to_frame(secs, self.preview_fps).to_string()
+        } else {
+            trim::format_timecode(secs)
+        };
+        if is_start {
+            self.ui.set_trim_start_text(text.into());
+        } else {
+            self.ui.set_trim_end_text(text.into());
+        }
+        // 填了值就把裁剪打开，否则填了也不生效
+        self.ui.set_trim_enabled(true);
+        self.ui.set_preview_scrubbing(false);
+    }
+
+    /// 取源视频帧率（按帧裁剪的换算要用）。探测结果沿用 `last_probe` 的缓存策略。
+    fn probe_fps_for_trim(&mut self) -> Option<f64> {
+        if let Some(info) = &self.last_probe {
+            if info.fps > 0.0 {
+                return Some(info.fps);
+            }
+        }
+        let path = self.ui.get_input_path().to_string();
+        let info = crate::services::ffmpeg::probe_media(&path)?;
+        let fps = info.fps;
+        self.last_probe = Some(info);
+        (fps > 0.0).then_some(fps)
     }
 
     fn handle_mode_changed(&mut self, text: String) {
@@ -599,6 +1024,12 @@ impl AppController {
         if let Some(log) = &self.current_log_path {
             cleanup_temp_files_public(log);
         }
+        // 先丢预览（Drop 里销毁 mpv，mpv 会放开它引用的那个窗口），
+        // 再销毁子窗口。顺序反了的话 mpv 会去操作一个已经不存在的句柄。
+        self.preview = None;
+        let host = self.preview_host as windows_sys::Win32::Foundation::HWND;
+        crate::platform::preview_window::destroy(host);
+        self.preview_host = 0;
     }
 
     // =============================================================
@@ -620,11 +1051,15 @@ impl AppController {
                     elapsed_secs,
                     remaining_secs,
                 } => {
-                    self.ui.set_pass_text(format!("Pass {pass_index}/{pass_count}").into());
+                    let snapshot = ProgressSnapshot {
+                        pass_index,
+                        pass_count,
+                        remaining_secs,
+                        elapsed_secs,
+                    };
+                    self.last_progress = Some(snapshot);
+                    self.apply_progress_texts(snapshot);
                     self.ui.set_percent_text(format!("{percent:.0}%").into());
-                    self.ui.set_eta_text(format!("ETA: {}", time::format_mmss(remaining_secs)).into());
-                    self.ui
-                        .set_elapsed_text(format!("Elapsed: {}", time::format_mmss(elapsed_secs)).into());
                     self.ui.set_progress_value((percent / 100.0) as f32);
                 }
                 Event::Completed(output_path) => {
@@ -652,12 +1087,48 @@ impl AppController {
         self.ui.set_progress_visible(false);
         self.ui.set_result_visible(true);
         if Path::new(output_path).exists() {
-            let size = std::fs::metadata(output_path)
+            let bytes = std::fs::metadata(output_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
-            self.ui
-                .set_output_size_text(format!("Output size: {:.2} MB", size as f64 / 1024.0 / 1024.0).into());
+            self.last_output_bytes = Some(bytes);
+            self.ui.set_output_size_text(self.result_size_text(bytes));
         }
+    }
+
+    /// 结果行里的「输出大小」文案，按当前语言拼。
+    fn result_size_text(&self, bytes: u64) -> SharedString {
+        self.strings
+            .result_output_size
+            .replace("{size}", &format!("{:.2}", bytes as f64 / 1024.0 / 1024.0))
+            .into()
+    }
+
+    /// 进度行三格的文字（第 x/y 遍、剩余、已用），按当前语言拼。
+    fn progress_texts(
+        &self,
+        p: ProgressSnapshot,
+    ) -> (SharedString, SharedString, SharedString) {
+        let pass = self
+            .strings
+            .progress_pass
+            .replace("{pass}", &p.pass_index.to_string())
+            .replace("{total}", &p.pass_count.to_string());
+        let eta = self
+            .strings
+            .progress_eta
+            .replace("{time}", &time::format_mmss(p.remaining_secs));
+        let elapsed = self
+            .strings
+            .progress_elapsed
+            .replace("{time}", &time::format_mmss(p.elapsed_secs));
+        (pass.into(), eta.into(), elapsed.into())
+    }
+
+    fn apply_progress_texts(&self, p: ProgressSnapshot) {
+        let (pass, eta, elapsed) = self.progress_texts(p);
+        self.ui.set_pass_text(pass);
+        self.ui.set_eta_text(eta);
+        self.ui.set_elapsed_text(elapsed);
     }
 
     // =============================================================
@@ -770,6 +1241,13 @@ impl AppController {
 
     fn set_encoding(&mut self, encoding: bool) {
         self.ui.set_encoding(encoding);
+        // 编码期间把预览停下：两边都吃 CPU，而且预览还占着音频设备。
+        // 界面上那几个按钮此时也已经禁用，这里只是保证音频真的停。
+        if encoding {
+            if let Some(p) = &self.preview {
+                p.set_paused(true);
+            }
+        }
     }
 
     /// 自动滚动到日志底部（去抖：同一帧内多次追加只调度一次）

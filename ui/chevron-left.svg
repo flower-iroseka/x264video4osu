@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 预览面板收起按钮的图标：指向左侧的三角。颜色由 Slint 的 Image.colorize 覆盖。 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="10" height="16" viewBox="0 0 10 16">
+  <path d="M9 1 L1 8 L9 15 Z" fill="#000000"/>
+</svg>

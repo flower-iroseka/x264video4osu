@@ -1,6 +1,6 @@
 [package]
 name = "x264video4osu"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2021"
 description = "Rust + Slint port of x264video4osu (osu! background video compressor)"
 license = "MIT"
@@ -16,6 +16,9 @@ rfd = "0.17.2"
 regex = "1.11"
 uuid = { version = "1.16", features = ["v4"] }
 open = "5.4.2"
+# 运行时动态加载 tools/libmpv-2.dll（预览用）。不引入编译期链接依赖：
+# 不需要 .lib 和头文件，DLL 缺失时预览功能整体禁用即可。
+libloading = "0.8"
 # 仅用 GetLocalTime 生成时间戳（旧程序使用 DateTime.Now 格式化）
 # windows-sys 0.61 中 GetLocalTime 位于 Win32_System_SystemInformation，
 # SYSTEMTIME 位于 Win32_Foundation（随该 feature 一并启用）。

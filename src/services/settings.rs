@@ -4,6 +4,7 @@
 //!
 //! ```ini
 //! lang=0
+//! preview=0
 //! ```
 //!
 //! 解析时对非法值静默忽略（回落到默认），写入时 best-effort 忽略 IO 错误，
@@ -24,9 +25,10 @@ fn clamp_lang_index(v: i32) -> i32 {
     v.clamp(0, LANG_COUNT - 1)
 }
 
-/// 应用设置。`lang_index` 对应 i18n::Lang（0=中文，1=English）。
+/// 应用设置。
 #[derive(Debug, Clone, Copy)]
 pub struct AppSettings {
+    /// 界面语言，对应 i18n::Lang（0=中文，1=English）
     pub lang_index: i32,
 }
 
@@ -53,22 +55,30 @@ fn settings_path() -> PathBuf {
 
 /// 读取设置文件；不存在或解析失败时返回默认值（不报错）。
 pub fn load() -> AppSettings {
-    let mut settings = AppSettings::default();
-    let Ok(content) = fs::read_to_string(settings_path()) else {
-        return settings;
-    };
+    match fs::read_to_string(settings_path()) {
+        Ok(content) => parse_settings(&content),
+        Err(_) => AppSettings::default(),
+    }
+}
 
+/// 解析设置文件内容。无法识别的行、以及超范围的值一律忽略，保留默认。
+/// 单独拆出来是为了能无头测试 —— `load()` 要读写 %APPDATA%，测不了。
+fn parse_settings(content: &str) -> AppSettings {
+    let mut settings = AppSettings::default();
     for line in content.lines() {
         let line = line.trim();
-        if let Some((key, value)) = line.split_once('=') {
-            match key.trim() {
-                "lang" => {
-                    if let Ok(v) = value.trim().parse::<i32>() {
-                        settings.lang_index = clamp_lang_index(v);
-                    }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "lang" => {
+                if let Ok(v) = value.trim().parse::<i32>() {
+                    settings.lang_index = clamp_lang_index(v);
                 }
-                _ => {}
             }
+            // 旧版本存过 "preview="（预览面板展开状态）。现在预览一律从收起开始，
+            // 不再记这个值，读到就忽略，免得老设置文件被当成坏文件。
+            _ => {}
         }
     }
     settings
@@ -99,5 +109,25 @@ mod tests {
         assert_eq!(clamp_lang_index(5), 1);
         assert_eq!(clamp_lang_index(-3), 0);
         assert_eq!(clamp_lang_index(i32::MAX), 1);
+    }
+
+    #[test]
+    fn parses_lang_and_ignores_other_keys() {
+        assert_eq!(parse_settings("lang=1\n").lang_index, 1);
+        assert_eq!(parse_settings("lang=0\n").lang_index, 0);
+        // 老版本写过的 preview 行现在被忽略，但不能让它把文件当成坏的
+        assert_eq!(parse_settings("lang=1\npreview=1\n").lang_index, 1);
+        assert_eq!(parse_settings("preview=1\nlang=1\n").lang_index, 1);
+    }
+
+    #[test]
+    fn missing_or_broken_values_keep_defaults() {
+        // 空文件 / 垃圾内容
+        assert_eq!(parse_settings("").lang_index, 0);
+        assert_eq!(parse_settings("这不是配置").lang_index, 0);
+        assert_eq!(parse_settings("preview=yes\n").lang_index, 0);
+
+        // lang 越界会被夹回来（和已有的那条测试同一个入口）
+        assert_eq!(parse_settings("lang=9\n").lang_index, 1);
     }
 }

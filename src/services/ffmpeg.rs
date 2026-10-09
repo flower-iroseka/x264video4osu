@@ -640,6 +640,10 @@ pub struct MediaInfo {
     pub fps: f64,
     /// 总帧数；容器没写时为估算值
     pub nb_frames: i64,
+    /// 视频宽度；拿不到时为 0。预览面板要按真实比例摆画面
+    pub width: u32,
+    /// 视频高度；拿不到时为 0
+    pub height: u32,
 }
 
 /// 解析 `24000/1001` 这种分数形式的帧率。
@@ -673,7 +677,7 @@ pub fn probe_media(input_path: &str) -> Option<MediaInfo> {
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=avg_frame_rate,r_frame_rate,nb_frames",
+        "stream=avg_frame_rate,r_frame_rate,nb_frames,width,height",
         "-show_entries",
         "format=duration",
         "-of",
@@ -695,6 +699,8 @@ pub fn probe_media(input_path: &str) -> Option<MediaInfo> {
     let mut avg_fps = 0.0_f64;
     let mut raw_fps = 0.0_f64;
     let mut nb_frames: i64 = 0;
+    let mut width: u32 = 0;
+    let mut height: u32 = 0;
 
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
@@ -706,6 +712,9 @@ pub fn probe_media(input_path: &str) -> Option<MediaInfo> {
             "r_frame_rate" => raw_fps = parse_rational(value),
             "nb_frames" => nb_frames = value.parse().unwrap_or(0),
             "duration" => duration = value.parse().unwrap_or(0.0),
+            // 宽高清不出来不算探测失败：预览面板拿不到就按 16:9 摆
+            "width" => width = value.parse().unwrap_or(0),
+            "height" => height = value.parse().unwrap_or(0),
             _ => {}
         }
     }
@@ -720,6 +729,8 @@ pub fn probe_media(input_path: &str) -> Option<MediaInfo> {
         duration,
         fps,
         nb_frames,
+        width,
+        height,
     })
 }
 

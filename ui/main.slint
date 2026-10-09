@@ -1,9 +1,12 @@
-import { Button, LineEdit, ComboBox, CheckBox, TabWidget, RadioGroup, ListView, HorizontalBox, VerticalBox, Palette } from "std-widgets.slint";
+import { Button, LineEdit, ComboBox, CheckBox, TabWidget, RadioGroup, ListView, Slider, HorizontalBox, VerticalBox, Palette } from "std-widgets.slint";
 
 // FluentMetrics 定义在 fluent-lite/styling.slint，这里再导出一次，Rust 侧才能通过
 // crate::FluentMetrics 写它里面的 device-pixel-ratio。
-import { FluentMetrics } from "fluent-lite/styling.slint";
+import { FluentMetrics, FluentPalette } from "fluent-lite/styling.slint";
 export { FluentMetrics }
+
+// 方形图标按钮（播放控件用的那种）。见 ui/icon-button.slint。
+import { IconButton } from "icon-button.slint";
 
 // 全部 UI 文本（随语言切换由 Rust 端一次性更新）
 export struct UiStrings {
@@ -59,6 +62,23 @@ export struct UiStrings {
     tip-trim-unit: string,
     tip-trim-start: string,
     tip-trim-end: string,
+    // ---- 视频预览 ----
+    tip-preview-expand: string,
+    tip-preview-collapse: string,
+    button-play: string,
+    button-pause: string,
+    button-set-start: string,
+    button-set-end: string,
+    tip-step-back: string,
+    tip-step-forward: string,
+    tip-goto-start: string,
+    tip-goto-end: string,
+    button-jump: string,
+    tip-jump: string,
+    tip-frame-input: string,
+    tip-time-input: string,
+    tip-set-start: string,
+    tip-set-end: string,
     // 文本框 / 单选框 / 标签
     tip-input-path: string,
     tip-output-path: string,
@@ -357,7 +377,9 @@ export component MainWindow inherits Window {
     // label-col-w 是左侧标签列宽度，实测中文最长标签 48px、英文 70px，各留几像素余量。
     // app.rs 的 DPI 修正直接读这两个属性，不重复写死。
     out property <length> label-col-w: root.language-index == 0 ? 52px : 78px;
-    out property <length> window-w: root.language-index == 0 ? 440px : 520px;
+    // 主体（收起预览时）的宽度。展开预览后窗口 = 主体 + 预览列。
+    out property <length> main-w: root.language-index == 0 ? 440px : 520px;
+    out property <length> window-w: root.main-w + (root.preview-expanded ? root.preview-w : 0px);
     // 「音频模式」下拉框要放下最长的选项（英文 "Copy audio stream" 实测 101px，
     // 加上下拉框自身左右各 11px 内边距和 20px 箭头 ≈ 143px），中文短一些。
     out property <length> audio-combo-w: root.language-index == 0 ? 112px : 150px;
@@ -366,7 +388,53 @@ export component MainWindow inherits Window {
     // 高度按内容实测：Video 页内容加底部按钮栏最少约 475px，留一点余量。
     // 再多出来的高度会进页面里的弹性占位，所以不用卡得很死。
     // 竖直间距改成 1.2 倍后总共长了约 18px，跟着加，不然最后一行会被裁掉。
-    out property <length> window-h: 524px;
+    // 后来结果行改成常驻（见下面的结果面板），又占掉约 7px，同样加上。
+    out property <length> window-h: 544px;
+
+    // ---- 视频预览面板 ----
+    // 收起时预览列宽度为 0，窗口就是原来的主体宽度；展开后窗口向右长出一列。
+    // 宽度按控制行实测：五个 28px 图标按钮 + 左右两组时间/帧数文字 + 第二行的
+    // 两个输入框和三个文字按钮，540px 装得下，英文标签长一些所以留到 580。
+    out property <length> preview-w: 580px;
+    // 画面区以外的固定高度。整块内容要上下居中，得先知道控件区有多高，
+    // 所以下面几项都按控件的实际高度写死：进度条 20px（fluent Slider 的 min-height）、
+    // 两行控件各 28px（图标按钮 / 输入框的高度），再加画面到进度条、进度条到
+    // 第一行、第一行到第二行这三处行距。改这几行的高度时这里要跟着改。
+    out property <length> video-pad: 10px;
+    out property <length> slider-h: 20px;
+    out property <length> control-row-h: 28px;
+    out property <length> preview-gap: 6px;
+    out property <length> preview-controls-h: root.slider-h + root.control-row-h * 2
+        + root.preview-gap * 3;
+    // 画面外圈那层边框：1px 空隙 + 1px 边线。边线必须画在 mpv 子窗口**外面**——
+    // 子窗口是原生窗口，盖在 Slint 画的所有东西上面，边线只要和它重叠就会被吃掉。
+    // 留的这 1px 空隙顺带兜住子窗口对齐设备像素时最多 1 个设备像素的外溢。
+    out property <length> video-frame: 2px;
+    // 画面宽高比，由 app.rs 用 ffprobe 探到后写进来；没有视频时按 16:9
+    in property <float> video-aspect: 1.7777778;
+    // 画面按比例塞进「面板宽 × (面板高 - 控件区)」这个框：宽度先受限就吃满宽，
+    // 高度先受限就吃满高。竖屏视频靠这一条才会缩窄，不会被拉变形。
+    out property <length> video-max-w: root.preview-w - root.video-pad * 2
+        - root.video-frame * 2;
+    out property <length> video-max-h: max(0px, root.window-h - root.video-pad * 2
+        - root.preview-controls-h - root.video-frame * 2);
+    out property <length> video-w: min(root.video-max-w, root.video-max-h * root.video-aspect);
+    out property <length> video-h: root.video-w / root.video-aspect;
+    // 画面加控件整块在面板里上下居中。preview-top 同时当布局的 padding-top 和
+    // 外圈边框的 y，两边共用一个值，不会对不上。
+    // 上下内边距都用这个值，画面加控件才会真的落在中间：只给上边距的话，多出来的
+    // 一截会留在布局里，被 VerticalBox 摊给两行控件，宽屏视频下按钮会被撑成大块。
+    out property <length> preview-top: max(root.video-pad,
+        (root.window-h - (root.video-h + root.video-frame * 2 + root.preview-controls-h)) / 2);
+    // 画面在面板里水平居中。这个算式和外层 VerticalBox 左右各留 video-pad、
+    // 固定宽度的子元素被居中之后的结果是同一个值。
+    out property <length> video-x: root.main-w + (root.preview-w - root.video-w) / 2;
+    out property <length> video-y: root.preview-top + root.video-frame;
+    // 展开状态。app.rs 启动时一律置为收起，不记上次的状态。
+    in-out property <bool> preview-expanded: false;
+    // 预览不可用（没有 libmpv-2.dll）时整个展开按钮和预览列都不出现。
+    in property <bool> preview-available: true;
+
     background: Palette.background;
 
     in property <UiStrings> strings;
@@ -425,6 +493,39 @@ export component MainWindow inherits Window {
     callback trim-unit-changed(string);
     callback scroll-log-to-end();
 
+    // ---------- 预览面板 ----------
+    // 状态由 app.rs 每 100ms 从 mpv 那边读一次后写进来。
+    in-out property <bool> preview-loaded: false;
+    in-out property <bool> preview-paused: true;
+    // 当前位置 / 总时长，两个拼起来显示成「当前时间 / 视频总时间」
+    in property <string> preview-time-text: "00:00:00.000";
+    in property <string> preview-duration-text: "00:00:00.000";
+    // 当前帧 / 总帧数。帧率探不出来时两个都是 "--"，帧数输入框同时禁用。
+    in property <string> preview-frame-cur: "--";
+    in property <string> preview-frame-total: "--";
+    in property <bool> preview-fps-known: false;
+    // 两个输入框：帧号和时间戳。改任意一个，app.rs 立刻把另一个换算成对应值写回来。
+    in-out property <string> preview-frame-input: "0";
+    in-out property <string> preview-time-input: "00:00:00.000";
+    // 进度条位置，量程 0..1000（滑块本身就是这个量程）。app.rs 按 mpv 的播放位置写它，
+    // 但拖动期间（preview-scrubbing 为真）不写，免得把用户刚拖到的位置又拽回去。
+    in-out property <float> preview-seek-1000: 0.0;
+    in-out property <bool> preview-scrubbing: false;
+    // 预览控件能不能用：文件加载好了、而且没在编码
+    property <bool> preview-controls-on: root.preview-loaded && !root.encoding;
+
+    callback preview-toggle-play();
+    callback preview-step(int);          // +1 / -1 帧
+    callback preview-seek(float);        // 0..1，松手时才发
+    callback preview-goto-start();       // 跳到视频开头
+    callback preview-goto-end();         // 跳到视频结尾
+    callback preview-frame-edited(string);   // 用户改了帧号框
+    callback preview-time-edited(string);    // 用户改了时间戳框
+    callback preview-jump-to-input();        // 跳到输入框指定的位置
+    callback preview-set-trim-start();
+    callback preview-set-trim-end();
+    callback preview-toggle-expanded();
+
     // 转发给日志组件，供 Rust 端在自动滚动时调用
     scroll-log-to-end => { log-view.scroll-to-end(); }
 
@@ -447,19 +548,26 @@ export component MainWindow inherits Window {
         }
 
         // ---- 主体内容 ----
-        VerticalBox {
+        // 宽度只占 main-w：预览列是它的兄弟节点，占右边那一列。
+        // x 必须显式写 0：只给 width 不给 x 的话，Slint 会把它水平居中，
+        // 展开窗口时看着就像整个界面被推到了中间。
+        main-col := VerticalBox {
+            x: 0px;
             y: 0px;
-            width: parent.width;
+            width: root.main-w;
             height: parent.height;
             // 竖直方向的间距统一放大到 1.2 倍（原来 padding 6px / spacing 3px），
             // 左右不动，只调上下。
             padding-left: 6px;
             padding-right: 6px;
             padding-top: 7.2px;
-            padding-bottom: 7.2px;
-            spacing: 3.6px;
+            // 底部比顶部留得多一点：最下面是一排带边框的按钮，挨着窗口边缘太挤
+            padding-bottom: 12px;
+            // 和 padding-bottom 取同一个值：底部按钮到窗口底边、到设置面板下边框的
+            // 距离要一样，不然按钮看着是贴在面板上的
+            spacing: 12px;
 
-        TabWidget {
+        main-tabs := TabWidget {
             horizontal-stretch: 1;
             vertical-stretch: 1;
 
@@ -626,11 +734,24 @@ export component MainWindow inherits Window {
                         // ---- 弹性占位：吸收富余高度，让设置行保持紧凑不拉伸 ----
                         Rectangle { vertical-stretch: 1; }
 
-                        // ---- 结果面板（编码结束后显示，置底） ----
-                        if (root.result-visible): HorizontalLayout {
+                        // ---- 结果面板（编码结束后显示） ----
+                        // 这一行常驻，只切换内容显不显示。原来是用 if 整行插入/移除，
+                        // 编码一结束标签页的最小高度就变大，把底部的开始/停止那一排顶下去，
+                        // 窗口高度是写死的，看着就是按钮上下跳了一下。
+                        HorizontalLayout {
+                            min-height: 28px;
                             spacing: 8px;
-                            Text { text: root.output-size-text; vertical-alignment: center; }
-                            Button { text: strings.button-open-folder; tooltip-text: strings.tip-open-folder; clicked => { root.open-folder(); } }
+                            Text {
+                                visible: root.result-visible;
+                                text: root.output-size-text;
+                                vertical-alignment: center;
+                            }
+                            Button {
+                                visible: root.result-visible;
+                                text: strings.button-open-folder;
+                                tooltip-text: strings.tip-open-folder;
+                                clicked => { root.open-folder(); }
+                            }
                             Rectangle { horizontal-stretch: 1; }
                         }
 
@@ -701,5 +822,257 @@ export component MainWindow inherits Window {
         }
 
         } // ---- 主体 VerticalBox 结束 ----
+
+        // ---- 预览列 ----
+        // 收起时宽度为 0，完全不占地方；展开后从主体右边缘往右铺开。
+        // 画面区那块矩形只是个占位：mpv 的原生子窗口会由 app.rs 摆到它上面。
+        Rectangle {
+            x: root.main-w;
+            y: 0px;
+            width: root.preview-expanded ? root.preview-w : 0px;
+            height: parent.height;
+            clip: true;
+            background: Palette.background;
+
+            VerticalBox {
+                padding-left: root.video-pad;
+                padding-right: root.video-pad;
+                // 上下边距都取算出来的居中位置：两边一样，块才落在面板正中，
+                // 而且不留余量给布局去摊
+                padding-top: root.preview-top;
+                padding-bottom: root.preview-top;
+                spacing: root.preview-gap;
+
+                // 画面外圈 + 占位。宽高按视频真实比例算，Rust 侧按同一份 video-*
+                // 摆 mpv 子窗口。
+                // 外面套一层 HorizontalLayout 是为了水平居中：VerticalBox 里固定宽度的
+                // 子元素是靠左摆的，而 video-x 按居中算，不套这一层两者会差出半个余量，
+                // 4:3 这类窄画面下就能看到占位矩形和画面错开一条边。
+                HorizontalLayout {
+                    vertical-stretch: 0;
+                    alignment: center;
+                    // 1px 灰边，颜色和宽度都跟设置页的内边框一致。边线和里面那张黑底
+                    // 占位之间留 1px 空隙：边线画在子窗口外面才不会被它盖掉。
+                    Rectangle {
+                        width: root.video-w + root.video-frame * 2;
+                        height: root.video-h + root.video-frame * 2;
+                        border-width: 1px;
+                        border-color: #E0E0E0;
+
+                        Rectangle {
+                            x: root.video-frame;
+                            y: root.video-frame;
+                            width: root.video-w;
+                            height: root.video-h;
+                            background: #000000;
+                        }
+                    }
+                }
+
+                // 进度条：拖到哪跳到哪，松手才 seek，拖动过程中不打断预览
+                Slider {
+                    value <=> root.preview-seek-1000;
+                    minimum: 0;
+                    maximum: 1000;
+                    step: 1;
+                    enabled: root.preview-controls-on;
+                    // 高度写死，preview-controls-h 那个常数才能对得上
+                    height: root.slider-h;
+                    // changed 只在用户操作时触发（app.rs 写属性不会触发），
+                    // 所以拿它当"正在拖"的信号是安全的。
+                    changed(v) => { root.preview-scrubbing = true; }
+                    released(v) => { root.preview-scrubbing = false; root.preview-seek(v / 1000); }
+                }
+
+                // 第一行：当前时间/总时长 | 播放控件 | 当前帧/总帧数
+                // 左右两段文字宽度写死成一样，中间那组图标按钮才是真正居中的
+                // （都用 stretch 的话，两边内容宽度不同，中间就会被挤偏）。
+                HorizontalLayout {
+                    spacing: 8px;
+                    min-height: root.control-row-h;
+                    vertical-stretch: 0;
+
+                    Text {
+                        width: 168px;
+                        vertical-alignment: center;
+                        horizontal-alignment: left;
+                        font-family: "Consolas";
+                        font-size: 11px;
+                        color: root.preview-loaded ? Palette.foreground : #909090;
+                        text: root.preview-time-text + " / " + root.preview-duration-text;
+                    }
+
+                    HorizontalLayout {
+                        horizontal-stretch: 1;
+                        alignment: center;
+                        spacing: 4px;
+
+                        IconButton {
+                            icon: @image-url("icons/skip-start.svg");
+                            enabled: root.preview-controls-on;
+                            tooltip-text: strings.tip-goto-start;
+                            clicked => { root.preview-goto-start(); }
+                        }
+                        IconButton {
+                            icon: @image-url("icons/step-back.svg");
+                            enabled: root.preview-controls-on;
+                            tooltip-text: strings.tip-step-back;
+                            clicked => { root.preview-step(-1); }
+                        }
+                        IconButton {
+                            icon: root.preview-paused
+                                ? @image-url("icons/play.svg")
+                                : @image-url("icons/pause.svg");
+                            enabled: root.preview-controls-on;
+                            tooltip-text: root.preview-paused ? strings.button-play : strings.button-pause;
+                            clicked => { root.preview-toggle-play(); }
+                        }
+                        IconButton {
+                            icon: @image-url("icons/step-forward.svg");
+                            enabled: root.preview-controls-on;
+                            tooltip-text: strings.tip-step-forward;
+                            clicked => { root.preview-step(1); }
+                        }
+                        IconButton {
+                            icon: @image-url("icons/skip-end.svg");
+                            enabled: root.preview-controls-on;
+                            tooltip-text: strings.tip-goto-end;
+                            clicked => { root.preview-goto-end(); }
+                        }
+                    }
+
+                    Text {
+                        width: 168px;
+                        vertical-alignment: center;
+                        horizontal-alignment: right;
+                        font-family: "Consolas";
+                        font-size: 11px;
+                        color: root.preview-loaded ? Palette.foreground : #909090;
+                        text: root.preview-frame-cur + " / " + root.preview-frame-total;
+                    }
+                }
+
+                // 第二行：设为开头 | 设为结尾 | 空白 | 帧号框 | 时间戳框 | 跳转
+                // 按钮不写 horizontal-stretch，让它们各自贴着文字那么宽
+                // （fluent-lite 的 Button 自带左右各 12px 内边距，这就是最紧凑的形状）。
+                HorizontalLayout {
+                    spacing: 6px;
+                    min-height: root.control-row-h;
+                    vertical-stretch: 0;
+
+                    Button {
+                        text: strings.button-set-start;
+                        enabled: root.preview-controls-on;
+                        tooltip-text: strings.tip-set-start;
+                        clicked => { root.preview-set-trim-start(); }
+                    }
+
+                    Button {
+                        text: strings.button-set-end;
+                        enabled: root.preview-controls-on;
+                        tooltip-text: strings.tip-set-end;
+                        clicked => { root.preview-set-trim-end(); }
+                    }
+
+                    // 空白：把后面那组输入框顶到右端
+                    Rectangle { horizontal-stretch: 1; }
+
+                    // 帧率探不出来时这个框没法换算，直接禁用
+                    // 两个框都不抢富余宽度，让中间的空白独占，框才是刚好装下内容的宽度
+                    LineEdit {
+                        min-width: 74px;
+                        horizontal-stretch: 0;
+                        text <=> root.preview-frame-input;
+                        enabled: root.preview-fps-known && root.preview-controls-on;
+                        tooltip-text: strings.tip-frame-input;
+                        edited(t) => { root.preview-frame-edited(t); }
+                    }
+
+                    LineEdit {
+                        min-width: 134px;
+                        horizontal-stretch: 0;
+                        text <=> root.preview-time-input;
+                        enabled: root.preview-controls-on;
+                        tooltip-text: strings.tip-time-input;
+                        edited(t) => { root.preview-time-edited(t); }
+                    }
+
+                    Button {
+                        text: strings.button-jump;
+                        enabled: root.preview-controls-on;
+                        tooltip-text: strings.tip-jump;
+                        clicked => { root.preview-jump-to-input(); }
+                    }
+                }
+            }
+        }
+
+        // ---- 展开/收起按钮：窄长竖条，骑在主体右边缘、竖直居中 ----
+        // 勾上「裁剪视频」后整条变蓝（配色和 150ms 过渡都跟复选框选中一样），
+        // 提醒这会儿预览是用来挑裁剪范围的。
+        expand-btn := Rectangle {
+            visible: root.preview-available;
+            x: root.main-w - self.width;
+            // 吸附到设备像素网格。窗口高 544px，不吸附的话这条按钮的上下边落在
+            // 半个设备像素上（125% 下 222 逻辑 = 277.5 物理），1px 的上下边线
+            // 被摊成两行半亮，看着像没有边；左右边正好落在整像素上所以是实的。
+            y: FluentMetrics.snap((root.height - self.height) / 2);
+            width: 20px;
+            height: 100px;
+            background: root.trim-enabled
+                ? (expand-touch.pressed ? FluentPalette.tertiary-accent-background
+                    : expand-touch.has-hover ? FluentPalette.secondary-accent-background
+                    : FluentPalette.accent-background)
+                : (expand-touch.has-hover ? #DCE9F7 : #F2F2F2);
+            border-width: 1px;
+            // 灰边两种状态都用，变蓝之后也留着
+            border-color: #C8C8C8;
+            border-radius: 3px;
+
+            animate background { duration: 150ms; }
+
+            expand-touch := TouchArea {
+                clicked => { root.preview-toggle-expanded(); }
+            }
+
+            Image {
+                width: 10px;
+                height: 16px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                colorize: root.trim-enabled ? #FFFFFF : #5A5A5A;
+                source: root.preview-expanded
+                    ? @image-url("chevron-left.svg")
+                    : @image-url("chevron-right.svg");
+
+                animate colorize { duration: 150ms; }
+            }
+        }
+
+        // 按钮的悬停提示。没用内建的 Tooltip：那个按鼠标位置弹，按钮正好在窗口
+        // 竖直中间那一道，展开后提示框会压在 mpv 子窗口底下（子窗口是原生窗口，
+        // 盖在 Slint 画的所有东西上面），只露出左边一条。这里固定画在按钮左侧，
+        // 那块地方是设置面板，两种状态下都完整可见。
+        Rectangle {
+            visible: root.preview-available && expand-touch.has-hover;
+            x: expand-btn.x - self.width - 6px;
+            y: expand-btn.y + (expand-btn.height - self.height) / 2;
+            width: btn-tip-text.width + 18px;
+            height: btn-tip-text.height + 12px;
+            background: Palette.alternate-background;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: Palette.border;
+
+            btn-tip-text := Text {
+                x: 9px;
+                y: 6px;
+                text: root.preview-expanded
+                    ? strings.tip-preview-collapse
+                    : strings.tip-preview-expand;
+                font-size: 12px;
+                color: Palette.foreground;
+            }
+        }
     }
 }
