@@ -33,8 +33,12 @@ use windows_sys::Win32::Foundation::HWND;
 
 /// 随程序分发的 libmpv 文件名。
 ///
-/// 注意是 `libmpv-2.dll` 而不是 `mpv-2.dll` —— mpv 官方 dev 包（shinchiro 的
-/// `mpv-dev-x86_64-*.7z`）里就是这个名字。
+/// 注意是 `libmpv-2.dll` 而不是 `mpv-2.dll` —— dev 包里就是这个名字。
+///
+/// 分发的是 LGPL 构建（zhongfly/mpv-winbuild 的 `mpv-dev-lgpl-x86_64-*.7z`，
+/// 构建参数里带 `-Dgpl=false`），不是 mpv 默认的 GPL 构建。本项目按 MIT 发布，
+/// 用 GPL 版的 libmpv 会要求整个程序跟着变 GPL；LGPL 版没这个约束，换 DLL 的时候
+/// 别拿错了。
 const LIBMPV_FILE: &str = "libmpv-2.dll";
 
 // ---- libmpv 的常量和结构（对着 include/mpv/client.h 抄） ----
@@ -67,8 +71,12 @@ struct MpvFns {
     error_string: unsafe extern "C" fn(c_int) -> *const c_char,
 }
 
+/// 音量上限。mpv 默认允许到 130（当放大器用），这里收在 100，
+/// 滑块 0..100 才和实际音量一一对应。
+pub const VOLUME_MAX: f64 = 100.0;
+
 /// 预览面板要显示的状态。UI 每 100ms 取一次。
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PreviewState {
     /// 已经装进一个文件（mpv 不在 idle）
     pub loaded: bool,
@@ -77,6 +85,24 @@ pub struct PreviewState {
     pub time_pos: f64,
     /// 总时长（秒）；未知时为 0
     pub duration: f64,
+    /// 音量 0..=[`VOLUME_MAX`]
+    pub volume: f64,
+    pub mute: bool,
+}
+
+impl Default for PreviewState {
+    fn default() -> Self {
+        // 不能 derive：derive 出来的 volume 是 0（静音），而 mpv 的初始音量是 100。
+        // 状态还没读到之前界面会先按这个默认值画，用 0 的话滑块会先闪到最左边。
+        Self {
+            loaded: false,
+            paused: false,
+            time_pos: 0.0,
+            duration: 0.0,
+            volume: VOLUME_MAX,
+            mute: false,
+        }
+    }
 }
 
 impl PreviewState {
@@ -94,9 +120,19 @@ impl PreviewState {
 enum Command {
     Open(PathBuf),
     SetPaused(bool),
+    /// 播放/暂停取反，由工作线程读实时状态决定方向。
+    TogglePlay,
     Seek(f64),
+    /// 相对当前位置跳，单位秒，可负。
+    SeekBy(f64),
     /// 正数前进、负数后退，单位是帧。逐帧步进用 ±1。
     StepFrames(i64),
+    /// 音量，0..=[`VOLUME_MAX`]
+    SetVolume(f64),
+    /// 在当前音量上加减，由工作线程读实时值。快捷键用，理由同 [`Command::ToggleMute`]。
+    StepVolume(f64),
+    /// 静音取反，同样由工作线程读实时状态。
+    ToggleMute,
 }
 
 /// 预览会话。持有它就代表预览开着；`Drop` 会停掉工作线程并销毁 mpv。
@@ -175,10 +211,26 @@ impl Preview {
         let _ = self.cmd_tx.send(Command::SetPaused(paused));
     }
 
+    /// 播放/暂停取反。
+    ///
+    /// 不用 `set_paused(!state().paused)`：`state()` 是 25ms 轮询出来的快照，
+    /// 长按空格时的自动重复会连着发好几条命令，拿旧快照算就会翻错。
+    /// 交给握着 mpv 的那个线程读实时值。
+    pub fn toggle_paused(&self) {
+        let _ = self.cmd_tx.send(Command::TogglePlay);
+    }
+
     /// 跳到绝对位置（秒）。精确 seek，用在进度条松手之后。
     pub fn seek(&self, secs: f64) {
         if secs.is_finite() && secs >= 0.0 {
             let _ = self.cmd_tx.send(Command::Seek(secs));
+        }
+    }
+
+    /// 相对当前位置跳（秒，可负）。快捷键用，两端由 mpv 自己夹住。
+    pub fn seek_by(&self, secs: f64) {
+        if secs.is_finite() && secs != 0.0 {
+            let _ = self.cmd_tx.send(Command::SeekBy(secs));
         }
     }
 
@@ -187,6 +239,29 @@ impl Preview {
         if n != 0 {
             let _ = self.cmd_tx.send(Command::StepFrames(n));
         }
+    }
+
+    /// 设音量，0..=[`VOLUME_MAX`]。超出范围的会被夹住。
+    pub fn set_volume(&self, volume: f64) {
+        if volume.is_finite() {
+            let _ = self.cmd_tx.send(Command::SetVolume(volume));
+        }
+    }
+
+    /// 在当前音量上加减 `delta`。快捷键用。
+    ///
+    /// 和 [`Preview::toggle_paused`] 一样交给工作线程算：`state()` 是 25ms 轮询的
+    /// 快照，连按 ↑ 时几条命令都拿同一份旧值加 5，结果只涨了一档。
+    pub fn step_volume(&self, delta: f64) {
+        if delta.is_finite() && delta != 0.0 {
+            let _ = self.cmd_tx.send(Command::StepVolume(delta));
+        }
+    }
+
+    /// 静音取反。和 [`Preview::toggle_paused`] 一样，交给工作线程读实时值，
+    /// 免得连按 M 时拿旧快照翻错。
+    pub fn toggle_mute(&self) {
+        let _ = self.cmd_tx.send(Command::ToggleMute);
     }
 }
 
@@ -316,6 +391,8 @@ fn configure(
         ("terminal", c"no"),
         ("msg-level", c"all=no"),
         ("audio-display", c"no"),
+        // 音量滑块只管 0..100；mpv 默认能到 130（当放大器用），这里收掉
+        ("volume-max", c"100"),
     ];
 
     // 测试时补进来的选项（关音频之类）得在 initialize 之前一起设
@@ -359,6 +436,19 @@ fn set_flag(fns: &MpvFns, handle: *mut c_void, name: &str, value: bool) -> c_int
             n.as_ptr(),
             MPV_FORMAT_FLAG,
             &mut v as *mut c_int as *mut c_void,
+        )
+    }
+}
+
+fn set_double(fns: &MpvFns, handle: *mut c_void, name: &str, value: f64) -> c_int {
+    let n = CString::new(name).unwrap();
+    let mut v = value;
+    unsafe {
+        (fns.set_property)(
+            handle,
+            n.as_ptr(),
+            MPV_FORMAT_DOUBLE,
+            &mut v as *mut f64 as *mut c_void,
         )
     }
 }
@@ -408,7 +498,13 @@ fn run_loop(
         loop {
             match cmd_rx.try_recv() {
                 Ok(cmd) => apply_command(fns, handle, cmd),
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                // 断开说明命令发送端没了，也就是 `Preview` 已经析构、或者压根没建起来
+                // （启动超时那条路 `stop` 永远不会被置位）。再转下去就是空转，收工。
+                Err(TryRecvError::Disconnected) => {
+                    shutdown = true;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
             }
         }
 
@@ -446,11 +542,23 @@ fn apply_command(fns: &MpvFns, handle: *mut c_void, cmd: Command) {
         Command::SetPaused(paused) => {
             set_flag(fns, handle, "pause", paused);
         }
+        Command::TogglePlay => {
+            let paused = get_flag(fns, handle, "pause").unwrap_or(true);
+            set_flag(fns, handle, "pause", !paused);
+        }
         Command::Seek(secs) => {
             let verb = CString::new("seek").unwrap();
             let value = CString::new(format!("{secs:.3}")).unwrap();
             // absolute+exact：精确到帧，裁剪打点用得上，代价是慢一点
             let mode = CString::new("absolute+exact").unwrap();
+            command(fns, handle, &[verb.as_c_str(), value.as_c_str(), mode.as_c_str()]);
+        }
+        Command::SeekBy(secs) => {
+            let verb = CString::new("seek").unwrap();
+            // 带符号的数字加 relative：让 mpv 按实时位置算，别拿我们手上那份
+            // 最多旧 25ms 的快照去加，长按连发会越走越偏
+            let value = CString::new(format!("{secs:+.3}")).unwrap();
+            let mode = CString::new("relative+exact").unwrap();
             command(fns, handle, &[verb.as_c_str(), value.as_c_str(), mode.as_c_str()]);
         }
         Command::StepFrames(n) => {
@@ -463,6 +571,17 @@ fn apply_command(fns: &MpvFns, handle: *mut c_void, cmd: Command) {
                 command(fns, handle, &[verb.as_c_str()]);
             }
         }
+        Command::SetVolume(volume) => {
+            set_double(fns, handle, "volume", volume.clamp(0.0, VOLUME_MAX));
+        }
+        Command::StepVolume(delta) => {
+            let volume = get_double(fns, handle, "volume").unwrap_or(VOLUME_MAX);
+            set_double(fns, handle, "volume", (volume + delta).clamp(0.0, VOLUME_MAX));
+        }
+        Command::ToggleMute => {
+            let mute = get_flag(fns, handle, "mute").unwrap_or(false);
+            set_flag(fns, handle, "mute", !mute);
+        }
     }
 }
 
@@ -472,6 +591,8 @@ fn refresh_state(fns: &MpvFns, handle: *mut c_void, state: &Arc<Mutex<PreviewSta
     let paused = get_flag(fns, handle, "pause").unwrap_or(true);
     let time_pos = get_double(fns, handle, "time-pos").unwrap_or(0.0);
     let duration = get_double(fns, handle, "duration").unwrap_or(0.0);
+    let volume = get_double(fns, handle, "volume").unwrap_or(VOLUME_MAX);
+    let mute = get_flag(fns, handle, "mute").unwrap_or(false);
 
     let mut s = state.lock().unwrap();
     let next = PreviewState {
@@ -479,6 +600,8 @@ fn refresh_state(fns: &MpvFns, handle: *mut c_void, state: &Arc<Mutex<PreviewSta
         paused,
         time_pos: if loaded { time_pos } else { 0.0 },
         duration,
+        volume,
+        mute,
     };
     if *s != next {
         *s = next;
@@ -500,6 +623,7 @@ mod tests {
             paused: false,
             time_pos: 5.0,
             duration: 0.0,
+            ..Default::default()
         };
         assert_eq!(s.progress(), 0.0);
 
@@ -520,8 +644,16 @@ mod tests {
     }
 
     #[test]
+    fn volume_defaults_to_full_not_zero() {
+        // mpv 起来时音量就是 100，默认值得跟着走，不然滑块会先闪到最左边
+        let s = PreviewState::default();
+        assert_eq!(s.volume, VOLUME_MAX);
+        assert!(!s.mute);
+    }
+
+    #[test]
     fn libmpv_file_name_is_the_real_one() {
-        // 官方 dev 包里的名字是 libmpv-2.dll，写成 mpv-2.dll 会一直加载失败
+        // dev 包里的名字是 libmpv-2.dll，写成 mpv-2.dll 会一直加载失败
         assert_eq!(LIBMPV_FILE, "libmpv-2.dll");
         let p = libmpv_path();
         assert!(p.ends_with(LIBMPV_FILE), "路径结尾不对: {}", p.display());
@@ -648,6 +780,64 @@ mod tests {
             "后退一帧之后是 {}，应该回到 {before}",
             s.time_pos
         );
+
+        // 相对跳转：±2 秒。走的是 mpv 的 relative，不是我们拿快照加一加
+        preview.seek_by(2.0);
+        let s = wait_until(&preview, Duration::from_secs(10), |s| s.time_pos > before + 1.5);
+        assert!(
+            (s.time_pos - (before + 2.0)).abs() < 0.25,
+            "seek_by(+2.0) 之后是 {}，应该接近 {}",
+            s.time_pos,
+            before + 2.0
+        );
+        preview.seek_by(-2.0);
+        let s = wait_until(&preview, Duration::from_secs(10), |s| (s.time_pos - before).abs() < 0.25);
+        assert!(
+            (s.time_pos - before).abs() < 0.25,
+            "seek_by(-2.0) 之后是 {}，应该回到 {before}",
+            s.time_pos
+        );
+
+        // 往回跳过头：mpv 会停在 0，不该跑到负数去
+        preview.seek(1.0);
+        let _ = wait_until(&preview, Duration::from_secs(10), |s| (s.time_pos - 1.0).abs() < 0.2);
+        preview.seek_by(-30.0);
+        let s = wait_until(&preview, Duration::from_secs(10), |s| s.time_pos < 0.2);
+        assert!(s.time_pos >= 0.0, "往回跳过头跑到负数了：{}", s.time_pos);
+
+        // 播放/暂停取反：连发两次回到原来的状态
+        let was_paused = preview.state().paused;
+        preview.toggle_paused();
+        let s = wait_until(&preview, Duration::from_secs(10), |s| s.paused != was_paused);
+        assert!(s.paused != was_paused, "toggle_paused 之后 pause 没跟着变");
+        preview.toggle_paused();
+        let s = wait_until(&preview, Duration::from_secs(10), |s| s.paused == was_paused);
+        assert!(s.paused == was_paused, "再 toggle 一次没回到原来的 pause 状态");
+
+        // 音量：属性名或格式写错的话，设下去读回来还是原来的值
+        preview.set_volume(40.0);
+        let s = wait_until(&preview, Duration::from_secs(10), |s| {
+            (s.volume - 40.0).abs() < 0.6
+        });
+        assert!(
+            (s.volume - 40.0).abs() < 0.6,
+            "音量设成 40 之后读回来是 {}",
+            s.volume
+        );
+
+        // 静音取反：从没静音开始，toggle 一次该静音，再一次该恢复
+        assert!(!preview.state().mute, "这时候不该是静音");
+        preview.toggle_mute();
+        let s = wait_until(&preview, Duration::from_secs(10), |s| s.mute);
+        assert!(s.mute, "toggle 之后没静音");
+        preview.toggle_mute();
+        let s = wait_until(&preview, Duration::from_secs(10), |s| !s.mute);
+        assert!(!s.mute, "再 toggle 一次还是静音");
+
+        // 超过上限要被夹住（volume-max 设成了 100）
+        preview.set_volume(1000.0);
+        let s = wait_until(&preview, Duration::from_secs(10), |s| s.volume <= VOLUME_MAX + 0.6);
+        assert!(s.volume <= VOLUME_MAX + 0.6, "音量越过上限了：{}", s.volume);
 
         drop(preview);
         unsafe { DestroyWindow(host) };

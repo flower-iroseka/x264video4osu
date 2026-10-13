@@ -10,261 +10,149 @@ A tool for encoding osu! background videos.
 
 ## Motivation
 
-The Maruko Tools Box (小丸工具箱) is no longer updated and doesn't support H.265 or AV1. I needed a one-click tool for compressing osu videos, so I wrote this.
+Maruko Tools Box (小丸工具箱) is no longer maintained and no longer supports H.265 or AV1 encoding. I developed this tool to make encoding osu! background videos more convenient.
 
-This is just an FFmpeg frontend to solve my personal video compression needs. Everything here can be done with command-line FFmpeg. Need more features? There are many open-source FFmpeg frontends available.
+This project is an FFmpeg frontend intended primarily for my own video-encoding needs. The same tasks can be performed using FFmpeg from the command line. For additional video-encoding features, other open-source FFmpeg frontends are available.
 
-**Note**: This project is entirely vibe coded. Quality is not guaranteed. For entertainment purposes only.
+**Note:** This project was developed entirely through vibe coding. Quality is not guaranteed; the project is provided for entertainment purposes only.
 
 ## Features
 
-- Supports **2-Pass VBR** and **CRF** encoding modes
-- Real-time encoding progress display (percentage, elapsed time, ETA)
-- Custom output resolution (scaling supported)
-- Audio mode: no audio / copy audio stream / transcode audio (AAC, FLAC)
-- Video trimming: set a start/end range by frame number or by time
-- Optional audio extraction
-- Supports Chinese and English interface
-- Detailed encoding log recording and export
-- Drag-and-drop file input support
+- Supports **2-Pass VBR** and **CRF** encoding modes.
+- Displays real-time encoding progress, including completion percentage, elapsed time, and estimated time remaining.
+- Supports custom output resolutions and scaling.
+- Provides three audio modes: no audio, copy the audio stream, or transcode audio to AAC or FLAC.
+- Provides video preview with playback, frame-by-frame navigation, and seeking. The current position can be used as the trim start or end.
+- Supports trimming by frame number or time; see [Trimming Video](#trimming-video).
+- Supports exporting the audio track separately, keeping the source codec; see [Extracting Audio](#extracting-audio).
+- Supports Chinese and English interfaces.
+- Records and exports detailed encoding logs.
+- Supports drag-and-drop video input.
 
-## Download & Setup
+## Download and Setup
 
 ### Requirements
 
-The following files are required in the `tools` folder (next to the executable):
+Place the following files in the `tools` directory, alongside `x264video4osu.exe`:
 
-- `ffmpeg.exe`
-- `ffprobe.exe`
+- `ffmpeg.exe`: Download a GPL build that includes x264 from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/).
+- `libmpv-2.dll` (optional; required only for video preview): Download `mpv-dev-lgpl-x86_64-*.7z` from [zhongfly's mpv Windows builds](https://github.com/zhongfly/mpv-winbuild/releases). The LGPL build keeps it compatible with this project's MIT license.
 
-**Note**: The release version already includes these files. You only need to download FFmpeg separately if you're building from source.
+**Note:** Release builds already include both files. These files only need to be prepared manually when building from source.
 
-Download from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (GPL builds with x264 included).
+Once the files are in place, run `x264video4osu.exe`. For the workflow, see [Usage](#usage).
 
-### Usage
+## Encoding Modes and Recommended Settings
 
-1. Place `ffmpeg.exe` and `ffprobe.exe` in the `tools` folder (next to `x264video4osu.exe`)
-2. Run `x264video4osu.exe`
-3. Select input video file
-4. Configure encoding parameters (or use defaults)
-5. Click "Start" to encode
+**CRF** (constant quality) is the default mode and is usually simpler to use. If a beatmap has a strict video file-size limit, use **2-Pass VBR** for more precise control over the output size.
 
-> The release exe is a single self-contained binary (static CRT) — no VC++ runtime or .NET install required. Just copy the exe + `tools/` folder to any Windows 10/11 machine.
-
-## Encoding Modes
-
-The program offers two main encoding modes. **CRF is the recommended default** for osu! background videos (typically anime OPs): it's fast, and animation content compresses so well that a moderate CRF already looks great at low bitrate. Use **2-Pass** when you must hit a precise file size without iterating.
-
-### CRF Mode (Constant Rate Factor) — Recommended Default
-
-**How it works**: Constant quality factor encoding, prioritizing quality over file size.
-
-| Item | Description |
-|------|-------------|
-| **Control method** | CRF value (range 0-51) |
-| **Default value** | 26 |
-| **Value meaning** | Lower value = better quality, larger file; higher value = lower quality, smaller file |
-| **Output size** | Unpredictable (depends on video content complexity) |
-| **Encoding speed** | Fast (single pass) |
-| **Use case** | Most osu! background videos — especially anime OPs at low bitrate |
-
-**CRF value reference**:
-
-| CRF value | Quality | Description |
-|-----------|---------|-------------|
-| 18-23 | Higher | Near-lossless, larger file |
-| 23-26 | Mid-high | Suitable for general purposes |
-| 26-28 | Medium | General use, controllable file size |
-| 28-32 | Lower | For low-bandwidth scenarios |
-| 32+ | Low | Not recommended for background videos |
-
-**Advantages**:
-- ✅ Fast encoding speed (single pass)
-- ✅ Simple configuration (only one quality value)
-- ✅ **Anime OPs at low bitrate**: animation has clean edges and large flat-color regions, so a moderate CRF (26-28) relatively easily yields a satisfying result at a small file size
-
-**Disadvantages**:
-- ❌ File size is unpredictable — expect to encode a few times, adjusting the CRF value, until you land in the desired size range
-- ❌ Complex or noisy scenes can exceed the osu! file size limit
-
----
-
-### 2-Pass VBR Mode (for Strict File-Size Control)
-
-**How it works**: First pass scans the video to analyze complexity, second pass allocates bitrate based on the analysis.
-
-| Item | Description |
-|------|-------------|
-| **Control method** | Fixed target bitrate (kbps) |
-| **Default value** | 800 kbps |
-| **Output size** | Precisely controlled (bitrate × duration ≈ file size) |
-| **Encoding speed** | Slower (requires two passes) |
-| **Use case** | Strict size budget; prefer not to iterate on CRF |
-
-**Advantages**:
-- ✅ Predictable and precisely controlled file size — set the bitrate and start encoding
-- ✅ Allocates more bits to complex scenes, saves bits on simple scenes
-
-**Disadvantages**:
-- ❌ Encoding time is approximately 2x single-pass
-- ❌ Relatively complex configuration (need to estimate appropriate bitrate)
-
-**File size estimation example** (at 800 kbps):
-
-| Duration | Estimated file size |
-|----------|---------------------|
-| 1 minute | ~6 MB |
-| 1.5 minutes | ~9 MB |
-| 2 minutes | ~12 MB |
-| 2.5 minutes | ~15 MB |
-| 3 minutes | ~18 MB |
-
----
-
-## Recommended Configuration (osu! Background Videos)
-
-For typical osu! background videos (usually anime OPs, under 2 minutes, < 15MB requirement):
-
-| Parameter | Recommended value | Description |
-|-----------|-------------------|-------------|
-| Encoding mode | **CRF** (default) | Animation compresses well; iterate the CRF value to hit your size |
-| CRF | **26-28** | Start at 26, then adjust by 1-2 to tune the output size |
-| Resolution | **720p or original** | Keep the original aspect ratio; osu! requires video dimensions no larger than 1280×720 |
-| FPS | **24** | Frame rate setting |
-
-**Quick workflow**: encode once at CRF 26. If the file is too large, raise CRF by 1-2 and re-encode; if you have room to spare, lower it for better quality. Because anime OPs compress so efficiently, you'll usually settle on a satisfying size after one or two tries.
-
-If you must fit a fixed budget exactly (e.g. a beatmap with a strict file-size limit), use **2-Pass** with an estimated bitrate. It costs roughly twice the encode time, but the output size is predictable.
-
-**Bitrate selection guide** (for 2-Pass):
-
-- Video duration under 1 minute: `800-1000 kbps`
-- Video duration 1-1.5 minutes: `700-900 kbps`
-- Video duration 1.5-2 minutes: `600-800 kbps`
+The wiki covers how both encoding modes work, CRF value references, file-size estimates, recommended settings for osu! background videos, and the x264 parameters used by the program: [Encoding Modes, Recommended Settings, and Technical Parameters](wiki/Home.md).
 
 ## Usage
 
 ### Basic Workflow
 
-1. **Select input video**
-   - Click "Browse" button to select file
-   - Or drag and drop video file onto the window
+1. **Select the input video.**
+   - Click **Browse** to select a video file.
+   - Alternatively, drag and drop the video file onto the program window.
 
-2. **Select output format**
-   - Use **flv** or **avi**. osu! stable has a known bug where mp4 background videos cause random game crashes ([forum thread](https://osu.ppy.sh/community/forums/topics/1976015?n=1)), so mp4 is not recommended.
+2. **Select the output format.**
+   - `flv` or `avi` is recommended. osu! stable has a known issue in which MP4 background videos may cause the game to crash randomly. See the [related discussion](https://osu.ppy.sh/community/forums/topics/1976015?n=1).
 
-3. **Set output path** (optional)
-   - If not set, automatically generates `{original_name}_output.flv` in the same directory
+3. **Set the output path (optional).**
+   - If no output path is specified, the program saves the file in the input file's directory as `{original_name}_output.flv`. The extension follows the selected output format.
 
-4. **Configure encoding parameters**
+4. **Configure the encoding parameters.**
 
    | Parameter | Description |
-   |-----------|-------------|
-   | **Output format** | flv / avi / mp4 |
-   | **Encoding Standard** | Select 2pass or CRF mode |
-   | **Value box** | 2pass = bitrate, CRF = quality value |
-   | **Resolution** | Width × Height, set to 0 to keep original |
-   | **Scale Up** | Allow upscaling (disabled by default) |
-   | **Audio mode** | No audio (default) / Copy audio stream / Transcode audio (AAC or FLAC; FLAC is mp4-only) |
-   | **Trim video** | Check to set a start/end range, by frame number or by time (HH:MM:SS.mmm) |
-   | **Extract Audio** | Extract audio track separately as .m4a file; when trimming, the exported track covers the trimmed range |
+   | --- | --- |
+   | **Output format** | Supported formats: `flv`, `avi`, and `mp4`. |
+   | **Encoding Standard** | Select `2-Pass VBR` or `CRF`. |
+   | **Value field** | In 2-Pass VBR mode, specifies the bitrate; in CRF mode, specifies the quality value. |
+   | **Resolution** | Set the output width and height. Set to `0` to preserve the original value. |
+   | **Scale Up** | Allows upscaling; disabled by default. |
+   | **Audio mode** | No audio (default), copy the audio stream, or transcode to AAC / FLAC. FLAC is available only for MP4. |
+   | **Trim video** | Enable trimming by frame number or time; see [Trimming Video](#trimming-video). |
+   | **Extract Audio** | Export the audio track as a separate file; see [Extracting Audio](#extracting-audio). |
 
-5. **Click "Start"** to begin encoding
+5. **Start encoding.**
+   - Click **Start**.
 
-6. **View progress**
-   - Main interface shows real-time progress
-   - "Log" tab shows detailed logs
+6. **Monitor progress.**
+   - The main interface displays real-time encoding progress.
+   - The **Log** tab displays detailed logs.
 
-7. **Completion**
-   - Displays output file size
-   - Click "Open Output Folder" to open output directory
+7. **Check the result.**
+   - When encoding finishes, the program displays the output file size.
+   - Click **Open Output Folder** to open the output directory.
 
-### Log Function
+### Trimming Video
 
-- Encoding process displayed in real-time on the Log tab
-- Save complete log via "Save Log" button
-- Log file naming format: `log_yyyyMMddHHmmss_randomNumber.txt`
+When **Trim video** is enabled, the program trims the chosen segment and encodes it.
+
+#### Setting the Trim Range
+
+| Control | Description |
+| --- | --- |
+| **Trim unit** | Select **Frames** or **Time**. Time accepts the `HH:MM:SS.mmm` format, such as `0:01:23.500`; `MM:SS` and seconds alone are also accepted. |
+| **Start / End** | Enter a frame number or timestamp according to the selected unit. |
+
+When the trim unit changes, the program automatically converts the entered start and end values to the new unit. No manual conversion is needed. The conversion requires the source video's frame rate, which the program reads automatically.
+
+#### Using the Preview to Set the Range
+
+The narrow strip along the right edge of the program window opens the video preview panel. In the panel, drag the seek bar, or enter a position in the frame-number or timestamp field and click **Jump**.
+
+To set the trim range:
+
+- Click **Set start** to use the current position as the trim start.
+- Click **Set end** to use the current position as the trim end.
+
+#### Keyboard Shortcuts
+
+The following shortcuts work only when focus is not in an input field:
+
+| Shortcut | Action |
+| --- | --- |
+| `Space` | Play / pause |
+| `D` / `F` | Step frame by frame |
+| `←` / `→` | Seek backward / forward by 5 seconds |
+| `Ctrl` + arrow key | Seek backward / forward by 30 seconds |
+| `Shift` + arrow key | Seek backward / forward by 1 minute |
+| `Home` / `End` | Jump to the beginning / end of the video |
+| `[` / `]` | Set the trim start / end to the current position |
+| `↑` / `↓` | Increase / decrease volume |
+| `M` | Mute / unmute |
+
+#### Notes
+
+- Trimming by frame number requires the source video's frame rate to be readable. If the frame rate cannot be read, the program suggests trimming by time instead. This can occur with some variable-frame-rate videos.
+
+### Extracting Audio
+
+Click **Extract Audio** to export the source audio track as its own file, at the same quality as the source.
+
+The audio goes to the same place the video output would, named `name_audio.ogg`.
+
+If **Trim video** is enabled, the exported audio is limited to the same trim range as the video.
+
+### Logging
+
+- Click **Save Log** to save the complete log.
+- Log file names use the format `log_yyyyMMddHHmmss_randomNumber.txt`.
 
 ### Language Switching
 
-The **Language** dropdown at the bottom-right of the window toggles between 中文 / English. The change takes effect immediately.
-
-The language selection is saved automatically to a config file and restored on the next launch:
-
-```
-%APPDATA%\x264video4osu\settings.ini
-```
-
-(`APPDATA` is usually `C:\Users\<username>\AppData\Roaming`; if the environment variable is missing, it falls back to the executable's directory.)
-
-The file contains a single `key=value` line:
-
-```ini
-lang=0
-```
-
-| Key | Values | Meaning |
-|-----|--------|---------|
-| `lang` | `0` / `1` | 中文 / English |
-
-**Restore defaults**: delete the file, or set the line to `0` — the next launch returns to the default setting (中文).
-
-## Technical Parameters
-
-### Default Encoding Parameters
-
-The program uses the following fixed parameters:
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| Encoder | libx264 | H.264 encoder |
-| Preset | veryslow | Slower encoding |
-| Profile | high | High profile |
-| Level | 5.2 | High level configuration |
-| Pixel format | yuv420p | Widely compatible pixel format |
-| GOP size | 300 | Maximum keyframe interval |
-| Minimum GOP | 240 | Minimum keyframe interval |
-| B frames | 16 | High B-frame count |
-| Motion estimation | UMH | UMH motion estimation |
-| Subpixel subdivision | 11 | Level 11 |
-
-### Advanced x264 Parameters
-
-```
-scenecut=0, ref=16, bframes=16, b-adapt=2, direct=auto,
-me=umh, subme=11, trellis=2, rc-lookahead=60, aq-mode=3,
-aq-strength=1.0, psy-rd=1.0,0.15, deblock=-1,-1,
-weightp=2, cabac=1, merange=32
-```
+Use the **Language** dropdown in the bottom-right corner of the window to switch between 中文 and English. The change takes effect immediately.
 
 ## Development
 
 ### Tech Stack
 
 - Rust (edition 2021)
-- Slint 1.17.1 (UI framework, Fluent style) + winit backend
-- femtovg renderer (OpenGL; vendored local patch for correct DPI anti-aliasing)
-- FFmpeg (via command-line invocation)
-
-### Project Structure
-
-```
-x264video4osu/
-├── src/                 # Rust application layer
-│   ├── main.rs          # Entry point; validates FFmpeg tools, runs event loop
-│   ├── app.rs           # AppController: wires UI callbacks ↔ services
-│   ├── i18n.rs          # All UI strings (zh-CN / en-US)
-│   ├── services/        # FFmpeg args, encoding orchestration, tool discovery
-│   ├── platform/        # Drag-drop, timestamps
-│   └── io/              # Opening URLs / folders
-├── ui/                  # Slint UI definitions (.slint, compiled at build time)
-│   ├── main.slint       # Main window
-│   └── dialogs/         # about / ffmpeg_not_found / message dialogs
-├── third_party/         # Vendored i-slint-renderer-femtovg (DPI patch)
-├── build.rs             # slint_build compilation
-├── tools/               # FFmpeg tools directory
-└── release/             # Built release bundle (exe + tools/)
-```
+- Slint 1.17.1: UI framework with Fluent styling and the winit backend
+- femtovg: OpenGL renderer; a local patch corrects anti-aliasing at different DPI scales
+- FFmpeg: invoked through the command line
 
 ### Build
 
@@ -273,10 +161,12 @@ cargo build --release
 cargo test
 ```
 
-Requires a Rust toolchain with the `x86_64-pc-windows-msvc` target. The release build statically links the CRT (see `.cargo/config.toml`), producing a self-contained exe with no runtime dependencies.
+Building requires a Rust toolchain with the `x86_64-pc-windows-msvc` target. The Release build statically links the CRT through `.cargo/config.toml`, producing a self-contained executable that does not depend on an external CRT runtime.
 
 ## License
 
 This project is released under the MIT License.
 
-The included FFmpeg programs (ffmpeg.exe, ffprobe.exe) are from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/), released under the **GPL v3** license.
+The included FFmpeg executable (`ffmpeg.exe`) is from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) and is released under the **GPL v3** license.
+
+The included mpv library (`libmpv-2.dll`) is an LGPL build of [mpv](https://mpv.io/) from [zhongfly/mpv-winbuild](https://github.com/zhongfly/mpv-winbuild), and is released under the **LGPL v2.1 or later** (LGPLv2.1+) license.

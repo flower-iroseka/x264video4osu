@@ -7,6 +7,7 @@ use crate::error::AppError;
 use crate::platform::time;
 use crate::services::args::EncodePlan;
 use crate::services::ffmpeg_config;
+use crate::services::probe;
 use regex::Regex;
 use std::io::{BufReader, Read, Write};
 use std::os::windows::process::CommandExt;
@@ -151,37 +152,51 @@ impl FfmpegService {
             live: run.live.clone(),
         };
         let ffmpeg = ffmpeg_config::ffmpeg_path();
-        let ffprobe = ffmpeg_config::ffprobe_path();
-        thread_spawn(move || {
+        let tx_fail = self.tx.clone();
+        let spawned = thread_spawn(move || {
             if let Err(e) = run_encoding(
                 &sender,
                 &run.stop_flag,
                 &run.active,
                 &run.current_pid,
                 &ffmpeg,
-                &ffprobe,
                 &plan,
             ) {
+                // 失败这条路以前不清理：2pass 的 passlog/mbtree 会永远留在输出目录里。
+                // 取消那条路由上的清理在 app.rs（停止按钮、关窗口都会调）。
+                if let Some(log_base) = &plan.log_file_path {
+                    cleanup_temp_files(&sender, log_base);
+                }
                 sender.send(Event::Failed(format!("{e}")));
             }
         });
+        if let Err(e) = spawned {
+            // 线程起不来就一个事件都不会来，界面上会永远停在「编码中」。
+            // 这里用原始 sender 直接发，绕过 RunSender 的存活过滤。
+            let _ = tx_fail.send(Event::Failed(format!(
+                "Failed to start encoder thread: {e}"
+            )));
+        }
     }
 }
 
-fn thread_spawn<F>(f: F)
+fn thread_spawn<F>(f: F) -> std::io::Result<()>
 where
     F: FnOnce() + Send + 'static,
 {
-    let _ = std::thread::Builder::new().name("ffmpeg-worker".into()).spawn(f);
+    std::thread::Builder::new()
+        .name("ffmpeg-worker".into())
+        .spawn(f)
+        .map(|_| ())
 }
 
 fn log(tx: &RunSender, msg: String) {
     tx.send(Event::Log(msg));
 }
 
-fn emit_cancelled(tx: &RunSender) {
+fn emit_cancelled(tx: &RunSender, label: &str) {
     log(tx, String::new());
-    log(tx, format!("[CANCELLED] Encoding cancelled by user at {}", time::local_timestamp()));
+    log(tx, format!("[CANCELLED] {label} cancelled by user at {}", time::local_timestamp()));
     log(tx, "========================================".into());
     tx.send(Event::Cancelled);
 }
@@ -201,7 +216,6 @@ fn run_encoding(
     active: &AtomicBool,
     current_pid: &Mutex<Option<u32>>,
     ffmpeg: &Path,
-    ffprobe: &Path,
     plan: &EncodePlan,
 ) -> Result<(), AppError> {
     let start_time = Instant::now();
@@ -213,10 +227,14 @@ fn run_encoding(
         extract_input(&plan.pass1)
     };
 
+    // 纯音频方案（只提取音轨）走的是同一个 worker，日志里的说法要跟着换，
+    // 不然一次「提取音轨」的日志全在讲编码。
+    let label = if plan.audio_only { "Audio extraction" } else { "Encoding" };
+
     // 记录开始时间和输入文件信息
     log(tx, String::new());
     log(tx, "========================================".into());
-    log(tx, format!("[START] Encoding started at {}", time::local_timestamp()));
+    log(tx, format!("[START] {label} started at {}", time::local_timestamp()));
     log(tx, "========================================".into());
 
     if !input_path.is_empty() && Path::new(&input_path).exists() {
@@ -234,10 +252,10 @@ fn run_encoding(
     log(tx, format!("[OUTPUT] Path: {}", plan.output.display()));
 
     // 源视频总时长。EncodePlan 带了覆盖值时以它为准：视频轨被 edit list 复制过、
-    // 用户又选了编两遍的文件，ffprobe 报的只是头部声明的那一遍。
+    // 用户又选了编两遍的文件，探测器报的只是头部声明的那一遍。
     let source_duration = plan
         .duration_override
-        .unwrap_or_else(|| get_media_duration(tx, ffprobe, &input_path));
+        .unwrap_or_else(|| get_media_duration(tx, ffmpeg, &input_path));
     // 进度用的是「这一遍实际要编多长」，不是源视频全长：`-ss`/`-to` 都排在 -i 前面，
     // ffmpeg 的 time= 从 0 走到 (终点 - 起点)，拿全长当分母的话进度条永远走不满。
     let total_duration =
@@ -256,15 +274,19 @@ fn run_encoding(
         ));
     }
 
-    // 动态计算总 pass 数
-    let has_audio = plan.audio_extract.is_some();
-    let pass_count: u32 = if plan.pass1.is_empty() {
-        if has_audio { 2 } else { 1 }
-    } else {
-        if has_audio { 3 } else { 2 }
-    };
+    // 总 pass 数：CRF 和纯音频都是一遍，2pass 两遍
+    let pass_count: u32 = if plan.pass1.is_empty() { 1 } else { 2 };
 
     let mut current_pass: u32 = 1;
+
+    // 清 2pass 的临时日志。取消那条路以前不清：app.rs 是在 stop() 返回后立刻删的，
+    // 那会儿 ffmpeg 还开着这个文件，Windows 上删除会失败（共享冲突），错误被吞掉，
+    // 文件就留下了。走到这里 ffmpeg 已经退出，才删得动。
+    let cleanup_logs = |tx: &RunSender| {
+        if let Some(log_base) = &plan.log_file_path {
+            cleanup_temp_files(tx, log_base);
+        }
+    };
 
     // ---------- PASS 1（仅 2pass） ----------
     if !plan.pass1.is_empty() {
@@ -276,22 +298,25 @@ fn run_encoding(
             start_time, current_pass, pass_count, total_duration,
         )?;
         if cancelled || stop.load(Ordering::SeqCst) {
-            emit_cancelled(tx);
+            cleanup_logs(tx);
+            emit_cancelled(tx, label);
             return Ok(());
         }
         log(tx, "[PASS 1/2] First pass completed".into());
         current_pass += 1;
     }
 
-    // ---------- PASS 2 / CRF 编码 ----------
+    // ---------- PASS 2 / CRF 编码 / 音轨提取 ----------
     let is_crf = plan.pass1.is_empty();
-    let pass_description = if is_crf { "CRF encoding" } else { "Second pass" };
-    let display_pass = if is_crf { 1 } else { 2 };
-    let display_total = if is_crf {
-        if has_audio { 2 } else { 1 }
+    let pass_description = if plan.audio_only {
+        "Audio extraction"
+    } else if is_crf {
+        "CRF encoding"
     } else {
-        if has_audio { 3 } else { 2 }
+        "Second pass"
     };
+    let display_pass = if is_crf { 1 } else { 2 };
+    let display_total = pass_count;
 
     log(tx, String::new());
     log(tx, format!("[PASS {display_pass}/{display_total}] Starting {pass_description}..."));
@@ -301,37 +326,20 @@ fn run_encoding(
         start_time, current_pass, pass_count, total_duration,
     )?;
     if cancelled || stop.load(Ordering::SeqCst) {
-        emit_cancelled(tx);
+        cleanup_logs(tx);
+        emit_cancelled(tx, label);
         return Ok(());
     }
     log(tx, format!("[PASS {display_pass}/{display_total}] {pass_description} completed"));
 
-    // ---------- AUDIO EXTRACT（可选） ----------
-    if let Some(audio_args) = &plan.audio_extract {
-        log(tx, String::new());
-        log(tx, "[PASS 3/3] Starting audio extraction...".into());
-        log(tx, format!("[CMD] ffmpeg {}", plan.display_audio));
-        let cancelled = run_process(
-            tx, stop, active, current_pid, ffmpeg, audio_args, &plan.output,
-            start_time, current_pass + 1, pass_count, total_duration,
-        )?;
-        if cancelled || stop.load(Ordering::SeqCst) {
-            emit_cancelled(tx);
-            return Ok(());
-        }
-        log(tx, "[PASS 3/3] Audio extraction completed".into());
-    }
-
     // 清理临时文件（仅 2pass 模式需要）
-    if let Some(log_base) = &plan.log_file_path {
-        cleanup_temp_files(tx, log_base);
-    }
+    cleanup_logs(tx);
 
     // 记录完成信息
     let total_elapsed = start_time.elapsed().as_secs_f64();
     log(tx, String::new());
     log(tx, "========================================".into());
-    log(tx, format!("[COMPLETE] Encoding finished at {}", time::local_timestamp()));
+    log(tx, format!("[COMPLETE] {label} finished at {}", time::local_timestamp()));
     log(tx, format!("[COMPLETE] Total elapsed time: {}", time::format_hms(total_elapsed)));
     log(tx, "========================================".into());
 
@@ -339,12 +347,16 @@ fn run_encoding(
         let size = std::fs::metadata(&plan.output).map(|m| m.len()).unwrap_or(0);
         log(tx, format!("[OUTPUT] File created: {}", plan.output.display()));
         log(tx, format!("[OUTPUT] Size: {:.2} MB", size as f64 / 1024.0 / 1024.0));
+        log(tx, String::new());
+        let _ = tx.send(Event::Completed(plan.output.to_string_lossy().into_owned()));
     } else {
-        log(tx, format!("[ERROR] Output file not found: {}", plan.output.display()));
+        // ffmpeg 退出码是 0 但没有输出文件（被别的程序删了、muxer 写去了别处）。
+        // 这里以前照样发 Completed，界面上显示「完成」，实际什么也没产出。
+        let msg = format!("Output file not found: {}", plan.output.display());
+        log(tx, format!("[ERROR] {msg}"));
+        log(tx, String::new());
+        return Err(AppError::EncodeFailed(msg));
     }
-    log(tx, String::new());
-
-    let _ = tx.send(Event::Completed(plan.output.to_string_lossy().into_owned()));
     Ok(())
 }
 
@@ -385,9 +397,25 @@ fn run_process(
     // ---------- stderr 读取线程 ----------
     let tx2 = tx.clone();
     let mut stderr = child.stderr.take().expect("stderr piped");
-    let reader = thread_spawn_and_join(move || {
-        read_stderr_and_report(&mut stderr, &tx2, start_time, pass_index, pass_count, total_duration);
-    });
+    let reader = match std::thread::Builder::new()
+        .name("stderr-reader".into())
+        .spawn(move || {
+            read_stderr_and_report(&mut stderr, &tx2, start_time, pass_index, pass_count, total_duration);
+        })
+    {
+        Ok(h) => h,
+        Err(e) => {
+            // 起不来就没有日志和进度可报，直接收摊；以前这里是 expect，
+            // 一 panic 就把 child 连同还在跑的 ffmpeg 一起丢了
+            let _ = kill_process_tree(pid);
+            child.wait().ok();
+            active.store(false, Ordering::SeqCst);
+            *current_pid.lock().unwrap() = None;
+            return Err(AppError::EncodeFailed(format!(
+                "Failed to start stderr reader: {e}"
+            )));
+        }
+    };
 
     // ---------- 等待退出 / 取消 ----------
     let mut cancelled = false;
@@ -400,7 +428,13 @@ fn run_process(
             Ok(Some(_)) => break,
             Ok(None) => {}
             Err(e) => {
+                // 别把 pid 留在共享格里就走人：kill_now / 下一轮 start 都靠它找进程，
+                // 留着一个已经结束的 pid，回头可能杀掉一个复用了这个号的无关进程。
+                let _ = kill_process_tree(pid);
+                child.wait().ok();
                 active.store(false, Ordering::SeqCst);
+                *current_pid.lock().unwrap() = None;
+                reader.join().ok();
                 return Err(AppError::EncodeFailed(format!("Failed to wait ffmpeg: {e}")));
             }
         }
@@ -463,14 +497,23 @@ fn read_stderr_and_report(
     total_duration: f64,
 ) {
     let progress_regex = Regex::new(r"time=(\d+):(\d+):(\d+\.\d+)").expect("regex ok");
+    // 估剩余要用「这一遍」已经跑了多久，不是整轮跑了多久：2pass 跑到第二遍时
+    // `start_time` 里还含着第一遍的时间，拿它算速度会把速度算小一半左右，
+    // 剩余时间跟着翻倍。整轮耗时另有用处（显示「已用」），不受影响。
+    let pass_start = Instant::now();
     let mut reader = BufReader::new(stderr);
     let mut chunk: Vec<u8> = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
     loop {
         chunk.clear();
+        let mut eof = false;
+        // 内层读一行：分隔符（\r 或 \n）被吃掉但不入 chunk
         loop {
             match reader.read(&mut byte) {
-                Ok(0) => break, // EOF
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
                 Ok(_) => {
                     // byte 只有 1 字节，read 最多返回 1
                     if byte[0] == b'\r' || byte[0] == b'\n' {
@@ -482,19 +525,13 @@ fn read_stderr_and_report(
             }
         }
         if chunk.is_empty() {
-            // 连续的分隔符，或 EOF
-            match reader.read(&mut byte) {
-                Ok(0) => break,
-                Ok(_) => {
-                    // 有更多内容但 chunk 为空说明是空行或前导分隔符
-                    if byte[0] != b'\r' && byte[0] != b'\n' {
-                        chunk.push(byte[0]);
-                        continue;
-                    }
-                    // 连续分隔符，重新走外层循环
-                }
-                Err(_) => break,
+            // 空行（两个分隔符挨着，比如 \r\n）。这里不能顺手多读一个字节再
+            // continue：continue 会走回外层的 chunk.clear()，把刚读到的那个
+            // 字节连同下一行的首字符一起丢掉。
+            if eof {
+                break;
             }
+            continue;
         }
         let line = String::from_utf8_lossy(&chunk);
         let trimmed = line.trim();
@@ -514,7 +551,8 @@ fn read_stderr_and_report(
             let current = h * 3600.0 + m * 60.0 + s;
             let percent = (current / total_duration * 100.0).clamp(0.0, 100.0);
             let elapsed = start_time.elapsed().as_secs_f64();
-            let speed = if elapsed > 0.0 { current / elapsed } else { 0.0 };
+            let pass_elapsed = pass_start.elapsed().as_secs_f64();
+            let speed = if pass_elapsed > 0.0 { current / pass_elapsed } else { 0.0 };
             let remaining = if speed > 0.0 {
                 (total_duration - current) / speed
             } else {
@@ -531,85 +569,20 @@ fn read_stderr_and_report(
     }
 }
 
-/// 读取 stderr 的辅助线程（返回 JoinHandle 供外层 join）
-fn thread_spawn_and_join<F>(f: F) -> std::thread::JoinHandle<()>
-where
-    F: FnOnce() + Send + 'static,
-{
-    std::thread::Builder::new()
-        .name("stderr-reader".into())
-        .spawn(f)
-        .expect("spawn stderr reader")
-}
-
-/// 通过 ffprobe 获取媒体总时长（秒），失败返回 0。
-fn get_media_duration(tx: &RunSender, ffprobe: &Path, input_path: &str) -> f64 {
+/// 媒体总时长（秒），失败返回 0。
+///
+/// 读的是 ffmpeg 横幅里容器声明的那个时长。它只当进度条的分母用，横幅的精度的
+/// 百分秒，差 2 ms 无所谓。
+fn get_media_duration(tx: &RunSender, ffmpeg: &Path, input_path: &str) -> f64 {
     if input_path.is_empty() {
         return 0.0;
     }
 
-    let mut cmd = Command::new(ffprobe);
-    cmd.args([
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-    ])
-    .arg(input_path)
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .creation_flags(CREATE_NO_WINDOW);
-
-    match cmd.output() {
-        Ok(out) => {
-            let s = String::from_utf8_lossy(&out.stdout);
-            s.trim().parse::<f64>().unwrap_or(0.0)
-        }
-        Err(e) => {
-            log(tx, format!("[WARN] Failed to get media duration: {e}"));
-            0.0
-        }
+    let banner = probe::read_banner(ffmpeg, input_path);
+    if !banner.opened {
+        log(tx, "[WARN] Failed to get media duration".into());
     }
-}
-
-/// 读源文件第一条音频流的编码名（`aac` / `opus` / `vorbis` / ...）。
-/// 没有音轨、文件读不了、ffprobe 不在，都返回 None。
-pub fn probe_audio_codec(input_path: &str) -> Option<String> {
-    if input_path.is_empty() {
-        return None;
-    }
-
-    let out = Command::new(ffmpeg_config::ffprobe_path())
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=codec_name",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(input_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
-
-    if !out.status.success() {
-        return None;
-    }
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
+    banner.duration
 }
 
 /// 这一遍实际要编多长（秒）。ffmpeg 的进度 `time=` 是相对输出时间轴的，
@@ -631,118 +604,6 @@ fn output_duration(source: f64, start: Option<f64>, end: Option<f64>) -> f64 {
     }
 }
 
-/// 源视频的基本信息（裁剪用：帧号要换算成秒，起止要按总时长 clamp）
-#[derive(Debug, Clone)]
-pub struct MediaInfo {
-    /// 总时长（秒）
-    pub duration: f64,
-    /// 视频帧率；拿不到时为 0
-    pub fps: f64,
-    /// 总帧数；容器没写时为估算值
-    pub nb_frames: i64,
-    /// 视频宽度；拿不到时为 0。预览面板要按真实比例摆画面
-    pub width: u32,
-    /// 视频高度；拿不到时为 0
-    pub height: u32,
-}
-
-/// 解析 `24000/1001` 这种分数形式的帧率。
-fn parse_rational(s: &str) -> f64 {
-    let s = s.trim();
-    match s.split_once('/') {
-        Some((num, den)) => {
-            let n: f64 = num.trim().parse().unwrap_or(0.0);
-            let d: f64 = den.trim().parse().unwrap_or(0.0);
-            if d == 0.0 {
-                0.0
-            } else {
-                n / d
-            }
-        }
-        None => s.parse().unwrap_or(0.0),
-    }
-}
-
-/// 用 ffprobe 读源视频的时长、帧率、总帧数。任一关键项拿不到就返回 None，
-/// 由调用方决定是报错还是退回按时间输入。
-pub fn probe_media(input_path: &str) -> Option<MediaInfo> {
-    if input_path.is_empty() {
-        return None;
-    }
-
-    let mut cmd = Command::new(ffmpeg_config::ffprobe_path());
-    cmd.args([
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=avg_frame_rate,r_frame_rate,nb_frames,width,height",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1",
-    ])
-    .arg(input_path)
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .creation_flags(CREATE_NO_WINDOW);
-
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-
-    let mut duration = 0.0_f64;
-    let mut avg_fps = 0.0_f64;
-    let mut raw_fps = 0.0_f64;
-    let mut nb_frames: i64 = 0;
-    let mut width: u32 = 0;
-    let mut height: u32 = 0;
-
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        match key.trim() {
-            "avg_frame_rate" => avg_fps = parse_rational(value),
-            "r_frame_rate" => raw_fps = parse_rational(value),
-            "nb_frames" => nb_frames = value.parse().unwrap_or(0),
-            "duration" => duration = value.parse().unwrap_or(0.0),
-            // 宽高清不出来不算探测失败：预览面板拿不到就按 16:9 摆
-            "width" => width = value.parse().unwrap_or(0),
-            "height" => height = value.parse().unwrap_or(0),
-            _ => {}
-        }
-    }
-
-    let fps = if avg_fps > 0.0 { avg_fps } else { raw_fps };
-    // mkv/webm 常常不写 nb_frames，用 时长 × 帧率 估算
-    if nb_frames <= 0 && duration > 0.0 && fps > 0.0 {
-        nb_frames = (duration * fps).round() as i64;
-    }
-
-    Some(MediaInfo {
-        duration,
-        fps,
-        nb_frames,
-        width,
-        height,
-    })
-}
-
-/// 视频轨被 edit list 整段复制过的检测结果。
-#[derive(Debug, Clone, Copy)]
-pub struct RepeatedTimeline {
-    /// 容器头（mvhd/mdhd）声明的时长，这类文件只算了一遍
-    pub declared: f64,
-    /// 按实际包数算出来的时长，ffmpeg 默认会按这个长度编
-    pub actual: f64,
-}
-
 /// ISOBMFF（mp4/mov 这一族）的头部特征：偏移 4 处是 `ftyp`。
 /// 只有这一族的 demuxer 会按 edit list 展开视频轨，别的容器不用白跑这次探测。
 fn is_isobmff(path: &str) -> bool {
@@ -760,69 +621,16 @@ fn is_isobmff(path: &str) -> bool {
 /// 排了两遍，ffmpeg 默认照着编两遍（349.2 秒）。进度条用的总时长取自声明值，于是跑到
 /// 一半就到 100%，之后的 ETA 全是 0，看着像是卡住了。
 ///
-/// 这里用 `-count_packets` 数出实际的包数反推真实时长。包数走容器索引，不解码，实测
-/// 100MB 的 mp4 只要 0.17 秒。只有实际时长明显超过声明值时才返回 Some。
-pub fn probe_repeated_timeline(input_path: &str) -> Option<RepeatedTimeline> {
+/// 数包那一趟走容器索引不解码，实测 100MB 的 mp4 要 0.29 秒，所以先用 `ftyp`
+/// 把非 mp4/mov 挡掉。`probe` 是已经探好的结果，声明时长和帧率都从它取。
+pub fn probe_repeated_timeline(
+    input_path: &str,
+    probe: &probe::Probe,
+) -> Option<probe::RepeatedTimeline> {
     if input_path.is_empty() || !is_isobmff(input_path) {
         return None;
     }
-
-    let mut cmd = Command::new(ffmpeg_config::ffprobe_path());
-    cmd.args([
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-count_packets",
-        "-show_entries",
-        "stream=avg_frame_rate,r_frame_rate,nb_read_packets",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1",
-    ])
-    .arg(input_path)
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .creation_flags(CREATE_NO_WINDOW);
-
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut declared = 0.0_f64;
-    let mut avg_fps = 0.0_f64;
-    let mut raw_fps = 0.0_f64;
-    let mut packets: i64 = 0;
-
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        match key.trim() {
-            "avg_frame_rate" => avg_fps = parse_rational(value),
-            "r_frame_rate" => raw_fps = parse_rational(value),
-            "nb_read_packets" => packets = value.parse().unwrap_or(0),
-            "duration" => declared = value.parse().unwrap_or(0.0),
-            _ => {}
-        }
-    }
-
-    let fps = if avg_fps > 0.0 { avg_fps } else { raw_fps };
-    if declared <= 0.0 || fps <= 0.0 || packets <= 0 {
-        return None;
-    }
-    let actual = packets as f64 / fps;
-    // 帧率取整、最后一帧不足一帧都会带来零点几秒的出入，留点余量再判。
-    if actual > declared + 1.0 && actual > declared * 1.02 {
-        Some(RepeatedTimeline { declared, actual })
-    } else {
-        None
-    }
+    probe::repeated_timeline(&ffmpeg_config::ffmpeg_path(), input_path, probe)
 }
 
 /// 强制终止进程树（`taskkill /F /T /PID <pid>`）。
@@ -884,16 +692,27 @@ pub fn cleanup_temp_files_public(log_base: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::args::{build, EncodeInput};
+    use crate::services::args::{build, build_audio_extract, AudioExtractInput, EncodeInput};
 
-    /// 定位仓库自带的 ffmpeg/ffprobe（仓库根下的 `tools/`）。
+    /// 定位仓库自带的 ffmpeg（仓库根下的 `tools/`）。
     fn tools_dir() -> Option<PathBuf> {
         let tools = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools");
-        if tools.join("ffmpeg.exe").exists() && tools.join("ffprobe.exe").exists() {
+        if tools.join("ffmpeg.exe").exists() {
             Some(tools)
         } else {
             None
         }
+    }
+
+    /// 探一遍再查 edit list。生产路径上 `Probe` 来自缓存，测试里现探。
+    fn repeated_of(ffmpeg: &Path, path: &Path) -> Option<probe::RepeatedTimeline> {
+        let p = probe::probe(
+            ffmpeg,
+            &path.to_string_lossy(),
+            &AtomicBool::new(false),
+            &mut |_| {},
+        );
+        probe_repeated_timeline(&path.to_string_lossy(), &p)
     }
 
     /// 测试用的发送端。live 恒为 true，事件不会被过滤掉。
@@ -902,6 +721,27 @@ mod tests {
             tx: tx.clone(),
             live: Arc::new(Mutex::new(true)),
         }
+    }
+
+    #[test]
+    fn blank_line_does_not_eat_the_next_lines_first_byte() {
+        // ffmpeg 的 stderr 里 \r 和 \n 会挨在一起（进度行用 \r 原地刷新）。
+        // 以前遇到这种空行会多读一个字节再 continue，而 continue 回到外层就是
+        // chunk.clear()，下一行的首字符就没了。
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = test_sender(&tx);
+        let mut input: &[u8] = b"alpha\r\nlibx264: ok\r\n\r\n[A]done\n";
+        read_stderr_and_report(&mut input, &sender, Instant::now(), 1, 1, 10.0);
+        drop(sender);
+
+        let lines: Vec<String> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::Log(l) => Some(l),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines, vec!["alpha", "libx264: ok", "[A]done"]);
     }
 
     #[test]
@@ -956,11 +796,10 @@ mod tests {
         EncodePlan {
             pass1: Vec::new(),
             pass2: Vec::new(),
-            audio_extract: None,
             display_pass1: String::new(),
             display_pass2: String::new(),
-            display_audio: String::new(),
             output: crate::testutil::scratch_path("dummy_never_created.mp4"),
+            audio_only: false,
             log_file_path: None,
             duration_override: None,
             trim_start_secs: None,
@@ -1004,7 +843,6 @@ mod tests {
             width_text: "0".into(),
             height_text: "0".into(),
             scale_up: false,
-            extract_audio: false,
             audio_mode_index: 0,
             audio_codec_index: 0,
             trim_start_secs: None,
@@ -1092,9 +930,11 @@ mod tests {
         let _ = std::fs::remove_file(&input);
     }
 
-    /// opus 这类编码 m4a 装不下，直接 `-c:a copy` 会写出 0 字节文件。这时应当转成 AAC。
+    /// 提取一律 `-c:a copy`，扩展名跟着源编码走，真的跑一遍确认 ffmpeg 认这个组合
+    /// ——容器挑错了它会报 "Could not find tag for codec ... in stream"，然后写出个
+    /// 0 字节文件。
     #[test]
-    fn audio_extract_transcodes_codecs_m4a_cannot_hold() {
+    fn audio_extract_copies_every_codec_into_a_matching_container() {
         let Some(tools) = tools_dir() else { return };
         let ffmpeg = tools.join("ffmpeg.exe");
 
@@ -1123,36 +963,21 @@ mod tests {
             }
         };
 
-        let plan_for = |input: &Path| {
-            build(EncodeInput {
+        // 跑一次真实的提取，返回 (ffmpeg 参数, 产物路径)
+        let extract = |input: &Path| -> (Vec<String>, PathBuf) {
+            // 生产路径上这个值来自探测缓存（`AudioExtractInput::source_audio_codec`），
+            // 测试里现探一次
+            let source_audio_codec =
+                probe::read_banner(&ffmpeg, &input.to_string_lossy()).audio_codec;
+            let plan = build_audio_extract(AudioExtractInput {
                 input_text: input.to_string_lossy().into_owned(),
                 output_text: String::new(),
-                format_index: 2, // mp4
-                mode_index: 0,
-                value_text: "26".into(),
-                width_text: "0".into(),
-                height_text: "0".into(),
-                scale_up: false,
-                extract_audio: true,
-                audio_mode_index: 0,
-                audio_codec_index: 0,
                 trim_start_secs: None,
                 trim_end_secs: None,
-                ignore_editlist: false,
-                duration_override: None,
+                source_audio_codec,
             })
-            .expect("plan should build")
-        };
+            .expect("plan should build");
 
-        if let Some(input) = make("libopus", "opus") {
-            let plan = plan_for(&input);
-            let audio = plan.audio_extract.as_ref().unwrap();
-            assert!(
-                audio.windows(2).any(|w| w[0] == "-c:a" && w[1] == "aac"),
-                "opus 源应当转成 AAC，实际: {audio:?}"
-            );
-
-            // 真跑一遍，确认出来的不是空文件
             let (tx, _rx) = std::sync::mpsc::channel();
             let stop = Arc::new(AtomicBool::new(false));
             let active = Arc::new(AtomicBool::new(false));
@@ -1163,7 +988,7 @@ mod tests {
                 &active,
                 &pid,
                 &ffmpeg,
-                audio,
+                &plan.pass2,
                 &plan.output,
                 Instant::now(),
                 1,
@@ -1172,23 +997,44 @@ mod tests {
             );
             assert!(res.is_ok(), "音频提取失败: {:?}", res.as_ref().err());
 
-            let stem = plan.output.file_stem().unwrap().to_string_lossy();
-            let extracted = plan.output.with_file_name(format!("{stem}_audio.m4a"));
-            let len = std::fs::metadata(&extracted).map(|m| m.len()).unwrap_or(0);
-            assert!(len > 0, "opus 提取出来的 m4a 不应当是空的");
+            (plan.pass2.clone(), plan.output.clone())
+        };
 
-            let _ = std::fs::remove_file(&extracted);
-            let _ = std::fs::remove_file(&input);
-        }
+        // (编码器, 探测回来的编码名, 提取出来该有的扩展名)
+        let cases = [
+            ("aac", "aac", "m4a"),
+            ("libopus", "opus", "ogg"),
+            ("flac", "flac", "flac"),
+            ("libmp3lame", "mp3", "mp3"),
+            ("ac3", "ac3", "ac3"),
+            ("eac3", "eac3", "eac3"),
+            ("pcm_s16le", "pcm_s16le", "wav"),
+        ];
 
-        // aac 源 m4a 装得下，应当保持复制，不做无谓的重编码
-        if let Some(input) = make("aac", "aac") {
-            let plan = plan_for(&input);
-            let audio = plan.audio_extract.as_ref().unwrap();
+        for (encoder, tag, ext) in cases {
+            // 造不出源就直接挂：静默跳过的话，某一行映射写错了也没人知道
+            let input = make(encoder, tag).unwrap_or_else(|| panic!("造不出 {encoder} 源"));
+
+            let (args, output) = extract(&input);
+
             assert!(
-                audio.windows(2).any(|w| w[0] == "-c:a" && w[1] == "copy"),
-                "aac 源应当直接复制，实际: {audio:?}"
+                args.windows(2).any(|w| w[0] == "-c:a" && w[1] == "copy"),
+                "{encoder} 源应当直接复制，实际: {args:?}"
             );
+            assert_eq!(
+                output.extension().unwrap(),
+                ext,
+                "{encoder} 源的扩展名应当是 {ext}"
+            );
+
+            let len = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
+            assert!(len > 0, "{encoder} 提取出来的文件不应当是空的");
+
+            // 产物里的编码名还得是源编码，没有偷偷转码
+            let got = probe::read_banner(&ffmpeg, &output.to_string_lossy()).audio_codec;
+            assert_eq!(got.as_deref(), Some(tag), "{encoder} 源提取后编码变了");
+
+            let _ = std::fs::remove_file(&output);
             let _ = std::fs::remove_file(&input);
         }
     }
@@ -1231,53 +1077,14 @@ mod tests {
         make_input_full(ffmpeg, tag, 1, false)
     }
 
-    /// 用 ffprobe 读容器时长（秒），读不到返回 0
-    fn probe_duration(ffprobe: &Path, path: &Path) -> f64 {
-        let out = Command::new(ffprobe)
-            .args([
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-            ])
-            .arg(path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .expect("spawn ffprobe");
-        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0.0)
+    /// 读容器声明的时长（秒），读不到返回 0
+    fn probe_duration(ffmpeg: &Path, path: &Path) -> f64 {
+        probe::read_banner(ffmpeg, &path.to_string_lossy()).duration
     }
 
-    /// 用 ffprobe 读输出里音频流的编码名；没有音轨返回 None
-    fn probe_stream_audio_codec(ffprobe: &Path, path: &Path) -> Option<String> {
-        let out = Command::new(ffprobe)
-            .args([
-                "-v",
-                "error",
-                "-select_streams",
-                "a:0",
-                "-show_entries",
-                "stream=codec_name",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-            ])
-            .arg(path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .expect("spawn ffprobe");
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
+    /// 读输出里音频流的编码名；没有音轨返回 None
+    fn probe_stream_audio_codec(ffmpeg: &Path, path: &Path) -> Option<String> {
+        probe::read_banner(ffmpeg, &path.to_string_lossy()).audio_codec
     }
 
     /// 端到端验证：用真实 ffmpeg 执行 args::build 生成的命令，确认
@@ -1289,7 +1096,6 @@ mod tests {
             return;
         };
         let ffmpeg = tools.join("ffmpeg.exe");
-        let ffprobe = tools.join("ffprobe.exe");
         let input = make_input(&ffmpeg, "crf");
 
         let plan = build(EncodeInput {
@@ -1301,7 +1107,6 @@ mod tests {
             width_text: "0".into(),
             height_text: "0".into(), // scale=iw:ih，保持 64×64 快速编码
             scale_up: false,
-            extract_audio: false,
             audio_mode_index: 0,
             audio_codec_index: 0,
             trim_start_secs: None,
@@ -1318,7 +1123,7 @@ mod tests {
         let active = Arc::new(AtomicBool::new(false));
         let current_pid = Arc::new(Mutex::new(None));
 
-        let res = run_encoding(&test_sender(&tx), &stop, &active, &current_pid, &ffmpeg, &ffprobe, &plan);
+        let res = run_encoding(&test_sender(&tx), &stop, &active, &current_pid, &ffmpeg, &plan);
         assert!(res.is_ok(), "run_encoding failed: {:?}", res.as_ref().err());
 
         // 事件：必须出现 Completed，且日志含 [START] / [COMPLETE] / [OUTPUT] Size
@@ -1351,7 +1156,6 @@ mod tests {
             return;
         };
         let ffmpeg = tools.join("ffmpeg.exe");
-        let ffprobe = tools.join("ffprobe.exe");
         let input = make_input(&ffmpeg, "twopass");
 
         let plan = build(EncodeInput {
@@ -1363,7 +1167,6 @@ mod tests {
             width_text: "0".into(),
             height_text: "0".into(),
             scale_up: false,
-            extract_audio: false,
             audio_mode_index: 0,
             audio_codec_index: 0,
             trim_start_secs: None,
@@ -1384,7 +1187,7 @@ mod tests {
         let active = Arc::new(AtomicBool::new(false));
         let current_pid = Arc::new(Mutex::new(None));
 
-        let res = run_encoding(&test_sender(&tx), &stop, &active, &current_pid, &ffmpeg, &ffprobe, &plan);
+        let res = run_encoding(&test_sender(&tx), &stop, &active, &current_pid, &ffmpeg, &plan);
         assert!(res.is_ok(), "run_encoding failed: {:?}", res.as_ref().err());
 
         let events: Vec<Event> = rx.try_iter().collect();
@@ -1425,7 +1228,6 @@ mod tests {
             return;
         };
         let ffmpeg = tools.join("ffmpeg.exe");
-        let ffprobe = tools.join("ffprobe.exe");
         let input = make_input_full(&ffmpeg, "trim", 2, false);
 
         let plan = build(EncodeInput {
@@ -1437,7 +1239,6 @@ mod tests {
             width_text: "0".into(),
             height_text: "0".into(),
             scale_up: false,
-            extract_audio: false,
             audio_mode_index: 0,
             audio_codec_index: 0,
             trim_start_secs: Some(0.5),
@@ -1453,10 +1254,10 @@ mod tests {
         let active = Arc::new(AtomicBool::new(false));
         let current_pid = Arc::new(Mutex::new(None));
 
-        let res = run_encoding(&test_sender(&tx), &stop, &active, &current_pid, &ffmpeg, &ffprobe, &plan);
+        let res = run_encoding(&test_sender(&tx), &stop, &active, &current_pid, &ffmpeg, &plan);
         assert!(res.is_ok(), "run_encoding failed: {:?}", res.as_ref().err());
 
-        let dur = probe_duration(&ffprobe, &output);
+        let dur = probe_duration(&ffmpeg, &output);
         eprintln!("trimmed output duration = {dur}s (expected ~1.0)");
         assert!(
             (dur - 1.0).abs() <= 0.25,
@@ -1487,7 +1288,6 @@ mod tests {
             return;
         };
         let ffmpeg = tools.join("ffmpeg.exe");
-        let ffprobe = tools.join("ffprobe.exe");
         let input = make_input_full(&ffmpeg, "audiomode", 1, true);
 
         // (mode_index, codec_index, format_index, 期望的音频编码名)
@@ -1507,14 +1307,13 @@ mod tests {
                 width_text: "0".into(),
                 height_text: "0".into(),
                 scale_up: false,
-                extract_audio: false,
-                audio_mode_index: mode,
+                    audio_mode_index: mode,
                 audio_codec_index: codec,
                 trim_start_secs: None,
                 trim_end_secs: None,
                 ignore_editlist: false,
                 duration_override: None,
-            })
+                })
             .expect("plan should build");
 
             let output = plan.output.clone();
@@ -1523,10 +1322,10 @@ mod tests {
             let active = Arc::new(AtomicBool::new(false));
             let current_pid = Arc::new(Mutex::new(None));
 
-            let res = run_encoding(&test_sender(&tx), &stop, &active, &current_pid, &ffmpeg, &ffprobe, &plan);
+            let res = run_encoding(&test_sender(&tx), &stop, &active, &current_pid, &ffmpeg, &plan);
             assert!(res.is_ok(), "run_encoding failed: {:?}", res.as_ref().err());
 
-            let got = probe_stream_audio_codec(&ffprobe, &output);
+            let got = probe_stream_audio_codec(&ffmpeg, &output);
             eprintln!("audio mode={mode} codec={codec} format={format} -> {got:?}");
             assert_eq!(
                 got.as_deref(),
@@ -1648,13 +1447,13 @@ mod tests {
 
         // 改造之前就是普通文件，不该被误报
         assert!(
-            probe_repeated_timeline(&path.to_string_lossy()).is_none(),
+            repeated_of(&ffmpeg, &path).is_none(),
             "a plain mp4 must not be reported as repeated"
         );
 
         duplicate_video_track_via_editlist(&path);
 
-        let got = probe_repeated_timeline(&path.to_string_lossy())
+        let got = repeated_of(&ffmpeg, &path)
             .expect("the duplicated edit list should be detected");
         assert!((got.declared - 2.0).abs() < 0.1, "declared = {}", got.declared);
         assert!((got.actual - 4.0).abs() < 0.1, "actual = {}", got.actual);
@@ -1662,15 +1461,20 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 非 mp4 容器（mkv）直接返回 None，连 ffprobe 都不用跑
+    /// 非 mp4 容器（mkv）直接返回 None，连数包那一趟都不用跑
     #[test]
     fn repeated_timeline_skips_non_isobmff() {
+        let Some(tools) = tools_dir() else {
+            eprintln!("tools/ffmpeg.exe not found — skipping non-isobmff test");
+            return;
+        };
+        let ffmpeg = tools.join("ffmpeg.exe");
         let path = crate::testutil::scratch_path(&format!(
             "editlist_neg_{}.mkv",
             std::process::id()
         ));
         std::fs::write(&path, b"\x1a\x45\xdf\xa3not an mp4 at all").unwrap();
-        assert!(probe_repeated_timeline(&path.to_string_lossy()).is_none());
+        assert!(repeated_of(&ffmpeg, &path).is_none());
         let _ = std::fs::remove_file(&path);
     }
 }

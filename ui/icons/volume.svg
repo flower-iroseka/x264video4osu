@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 音量（有声）。喇叭朝右，右边两道弧线当作声波。 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14">
+  <path d="M1.4 5.1 L3.7 5.1 L6.3 2.7 L6.3 11.3 L3.7 8.9 L1.4 8.9 Z" fill="#000000"/>
+  <path d="M8.9 5.0 A 2.5 2.5 0 0 1 8.9 9.0" fill="none" stroke="#000000" stroke-width="1.2" stroke-linecap="round"/>
+  <path d="M10.8 3.1 A 4.9 4.9 0 0 1 10.8 10.9" fill="none" stroke="#000000" stroke-width="1.2" stroke-linecap="round"/>
+</svg>

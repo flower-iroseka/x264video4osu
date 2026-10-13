@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 
-const UI_FILES: [&str; 4] = [
+const UI_FILES: [&str; 5] = [
     "ui/main.slint",
     "ui/dialogs/about.slint",
     "ui/dialogs/ffmpeg_not_found.slint",
     "ui/dialogs/message.slint",
+    "ui/dialogs/probing.slint",
 ];
 
 fn compile_slint(
@@ -76,6 +77,12 @@ fn main() {
     let third_party = manifest_dir.join("third_party");
     // 顺序：风格目录在前（保证 `std-widgets.slint` 裸导入命中），父目录在后（风格校验）。
     let include_paths = vec![third_party.join("fluent-lite"), third_party];
+
+    // `@image-url` 引用的图标走的是编译器的图片内嵌那条路，不进 `all_loaded_files`
+    // （那个集合只收 .slint 文档），所以只改 svg 不会触发重新生成 UI。单独盯一下
+    // `ui` 整个目录 —— cargo 对目录是递归比修改时间的，图标散在 `ui/icons/`、
+    // `ui/` 根下（chevron-*.svg）和 `ui/dialogs/`（message-*.svg）几处，只盯一个子目录会漏。
+    println!("cargo:rerun-if-changed=ui");
 
     for f in UI_FILES {
         compile_slint(&manifest_dir, &out_dir, f, include_paths.clone());

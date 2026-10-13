@@ -31,7 +31,7 @@ cargo test
 ```
 
 ### Runtime requirements
-- FFmpeg tools `ffmpeg.exe` + `ffprobe.exe` must exist in a `tools/` folder **next to the executable** (or relative to cwd). The app shows a "download / exit" dialog when missing.
+- The FFmpeg tool `ffmpeg.exe` must exist in a `tools/` folder **next to the executable** (or relative to cwd). The app shows a "download / exit" dialog when missing.
 - Release is built with static CRT (`.cargo/config.toml` → `+crt-static`), so the exe has no VC++ runtime dependency.
 
 ### Known gotchas (VERY IMPORTANT — do not regress these)

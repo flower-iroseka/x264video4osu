@@ -30,9 +30,10 @@ include!(concat!(env!("OUT_DIR"), "/main.rs"));
 include!(concat!(env!("OUT_DIR"), "/about.rs"));
 include!(concat!(env!("OUT_DIR"), "/ffmpeg_not_found.rs"));
 include!(concat!(env!("OUT_DIR"), "/message.rs"));
+include!(concat!(env!("OUT_DIR"), "/probing.rs"));
 
 fn main() {
-    // 先校验 FFmpeg / ffprobe 工具，缺失时展示提示对话框；无论点击哪个按钮
+    // 先校验 FFmpeg 工具，缺失时展示提示对话框；无论点击哪个按钮
     // 对话框关闭后都退出进程（与旧程序一致，退出码 1）。
     if services::ffmpeg_config::validate_tools().is_err() {
         show_tools_missing_dialog();

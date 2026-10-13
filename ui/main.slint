@@ -22,7 +22,7 @@ export struct UiStrings {
     label-width: string,
     label-height: string,
     check-scale-up: string,
-    check-extract-audio: string,
+    button-extract-audio: string,
     button-start: string,
     button-stop: string,
     check-auto-scroll: string,
@@ -67,6 +67,8 @@ export struct UiStrings {
     tip-preview-collapse: string,
     button-play: string,
     button-pause: string,
+    button-mute: string,
+    button-unmute: string,
     button-set-start: string,
     button-set-end: string,
     tip-step-back: string,
@@ -393,9 +395,9 @@ export component MainWindow inherits Window {
 
     // ---- 视频预览面板 ----
     // 收起时预览列宽度为 0，窗口就是原来的主体宽度；展开后窗口向右长出一列。
-    // 宽度按控制行实测：五个 28px 图标按钮 + 左右两组时间/帧数文字 + 第二行的
-    // 两个输入框和三个文字按钮，540px 装得下，英文标签长一些所以留到 580。
-    out property <length> preview-w: 580px;
+    // 宽度按第一行的控制走：左右两段各 214px（时间 / 帧数）夹住中间 156px 的
+    // 播放键组，再加上音量条和静音键，540px 装不下；英文标签更长，所以留到 620。
+    out property <length> preview-w: 620px;
     // 画面区以外的固定高度。整块内容要上下居中，得先知道控件区有多高，
     // 所以下面几项都按控件的实际高度写死：进度条 20px（fluent Slider 的 min-height）、
     // 两行控件各 28px（图标按钮 / 输入框的高度），再加画面到进度条、进度条到
@@ -403,6 +405,14 @@ export component MainWindow inherits Window {
     out property <length> video-pad: 10px;
     out property <length> slider-h: 20px;
     out property <length> control-row-h: 28px;
+    // 第一行左右两段固定成一样宽，中间那组播放键才是真正居中的
+    // （两边宽度不同的话，中间会被挤偏）。算法是
+    // (preview-w - video-pad*2 - 两处 8px 行距 - 播放键组 156px) / 2，
+    // 改面板宽度或播放键个数时要跟着改，不然播放/暂停键就不在正中间了。
+    out property <length> preview-side-w: 214px;
+    // 音量条的长度。写死而不是让它伸缩：右边帧数的位数会变（9 位变 10 位），
+    // 伸缩的话音量条会跟着一抽一抽的。
+    out property <length> volume-slider-w: 88px;
     out property <length> preview-gap: 6px;
     out property <length> preview-controls-h: root.slider-h + root.control-row-h * 2
         + root.preview-gap * 3;
@@ -410,7 +420,7 @@ export component MainWindow inherits Window {
     // 子窗口是原生窗口，盖在 Slint 画的所有东西上面，边线只要和它重叠就会被吃掉。
     // 留的这 1px 空隙顺带兜住子窗口对齐设备像素时最多 1 个设备像素的外溢。
     out property <length> video-frame: 2px;
-    // 画面宽高比，由 app.rs 用 ffprobe 探到后写进来；没有视频时按 16:9
+    // 画面宽高比，由 app.rs 探测到后写进来；没有视频时按 16:9
     in property <float> video-aspect: 1.7777778;
     // 画面按比例塞进「面板宽 × (面板高 - 控件区)」这个框：宽度先受限就吃满宽，
     // 高度先受限就吃满高。竖屏视频靠这一条才会缩窄，不会被拉变形。
@@ -449,7 +459,6 @@ export component MainWindow inherits Window {
     in-out property <string> width-text: "0";
     in-out property <string> height-text: "720";
     in-out property <bool> scale-up: false;
-    in-out property <bool> extract-audio: false;
     // ---------- 音频 / 裁剪 ----------
     in-out property <int> audio-mode-index: 0;      // 0 = 无音频, 1 = 复制音频流, 2 = 转码音频
     in-out property <int> audio-codec-index: 0;     // 0 = AAC, 1 = FLAC（仅 mp4）
@@ -484,6 +493,8 @@ export component MainWindow inherits Window {
     callback browse-output();
     callback start-encode();
     callback stop-encode();
+    // 提取音轨是独立的一次运行（只导音频、不编视频），所以是按钮不是复选框
+    callback extract-audio();
     callback open-folder();
     callback save-log();
     callback show-about();
@@ -511,12 +522,24 @@ export component MainWindow inherits Window {
     // 但拖动期间（preview-scrubbing 为真）不写，免得把用户刚拖到的位置又拽回去。
     in-out property <float> preview-seek-1000: 0.0;
     in-out property <bool> preview-scrubbing: false;
+    // 音量条位置 0..100，和 mpv 的 volume 一一对应（volume-max 那边也设成了 100）。
+    // 拖动期间（preview-vol-dragging 为真）app.rs 不写它，理由和进度条一样。
+    in-out property <float> preview-volume: 100.0;
+    in-out property <bool> preview-vol-dragging: false;
+    in-out property <bool> preview-muted: false;
     // 预览控件能不能用：文件加载好了、而且没在编码
     property <bool> preview-controls-on: root.preview-loaded && !root.encoding;
+    // 预览的键盘快捷键生不生效。面板收起来时不留活口，免得在设置页敲空格
+    // 把看不见的预览给放起来。
+    property <bool> preview-keys-on: root.preview-controls-on && root.preview-expanded;
 
     callback preview-toggle-play();
     callback preview-step(int);          // +1 / -1 帧
     callback preview-seek(float);        // 0..1，松手时才发
+    callback preview-seek-by(float);     // 相对当前位置跳，单位秒，可负（快捷键用）
+    callback preview-set-volume(float);  // 0..100，拖动过程中一直发
+    callback preview-volume-step(float); // 在当前音量上加减，↑/↓ 用
+    callback preview-toggle-mute();
     callback preview-goto-start();       // 跳到视频开头
     callback preview-goto-end();         // 跳到视频结尾
     callback preview-frame-edited(string);   // 用户改了帧号框
@@ -528,6 +551,20 @@ export component MainWindow inherits Window {
 
     // 转发给日志组件，供 Rust 端在自动滚动时调用
     scroll-log-to-end => { log-view.scroll-to-end(); }
+
+    // 把键盘焦点收回预览快捷键那一层。app.rs 在启动和展开面板时调；预览里会抢焦点
+    // 的那几个控件（第二行的三个按钮、进度条）点完也会调回来。
+    //
+    // 为什么非得显式收：Slint 只把按键送给「当前有焦点的那个元素」，没有元素有焦点
+    // 时按键直接丢掉。另外 bg-focus 和预览列是兄弟节点，不是它的祖先，所以焦点跑到
+    // 预览控件上之后键也不会冒泡过来——只能主动把它拉回焦点。
+    //
+    // fluent-lite 的 Button 点击时会 focus() 到一个不可见的空 FocusScope（为了让
+    // 正在编辑的文本框失焦），进度条的 SliderBase 按下时也会 focus() 自己，这两处
+    // 都会把焦点从 bg-focus 带走，不收回来快捷键就一直收不到键。
+    public function focus-preview-keys() {
+        bg-focus.focus();
+    }
 
     // 根容器：普通 Rectangle（非布局），子元素用绝对坐标摆放。
     // 窗口用系统原生标题栏，主体 VerticalBox 铺满整个窗口。
@@ -545,6 +582,74 @@ export component MainWindow inherits Window {
             width: parent.width;
             height: parent.height;
             focus-on-tab-navigation: false;
+
+            // ---- 预览的键盘快捷键 ----
+            // 键位照 PotPlayer 1.7 的默认键位表挑的。
+            //
+            // 用 key-pressed 不用 capture_key_pressed：capture_* 在焦点元素之前跑，
+            // 会在用户往帧号框里打字时也把空格吃掉；key-pressed 是焦点元素拒绝之后
+            // 才轮到的，文本输入天然优先。
+            //
+            // 字母和方括号按「字符」匹配（Slint 的 Key.D 就是 "d"），大小写各写一次，
+            // 免得 CapsLock 或者按着 Shift 时失灵。
+            key-pressed(event) => {
+                if (!root.preview-keys-on) {
+                    reject
+                } else if (event.text == Key.Space) {
+                    root.preview-toggle-play();
+                    accept
+                } else if (event.text == Key.LeftArrow) {
+                    // Ctrl 30 秒 / Shift 1 分钟 / 不带修饰 5 秒
+                    if (event.modifiers.control) {
+                        root.preview-seek-by(-30);
+                    } else if (event.modifiers.shift) {
+                        root.preview-seek-by(-60);
+                    } else {
+                        root.preview-seek-by(-5);
+                    }
+                    accept
+                } else if (event.text == Key.RightArrow) {
+                    if (event.modifiers.control) {
+                        root.preview-seek-by(30);
+                    } else if (event.modifiers.shift) {
+                        root.preview-seek-by(60);
+                    } else {
+                        root.preview-seek-by(5);
+                    }
+                    accept
+                } else if (event.text == Key.UpArrow) {
+                    // 交给 Rust 侧按 mpv 的实时音量加，别拿界面那份 100ms 前的
+                    // 快照加：连按两下会都按同一个旧值算，只涨一档
+                    root.preview-volume-step(5);
+                    accept
+                } else if (event.text == Key.DownArrow) {
+                    root.preview-volume-step(-5);
+                    accept
+                } else if (event.text == Key.M || event.text == "M") {
+                    root.preview-toggle-mute();
+                    accept
+                } else if (event.text == Key.D || event.text == "D") {
+                    root.preview-step(-1);
+                    accept
+                } else if (event.text == Key.F || event.text == "F") {
+                    root.preview-step(1);
+                    accept
+                } else if (event.text == Key.Home) {
+                    root.preview-goto-start();
+                    accept
+                } else if (event.text == Key.End) {
+                    root.preview-goto-end();
+                    accept
+                } else if (event.text == Key.OpenBracket) {
+                    root.preview-set-trim-start();
+                    accept
+                } else if (event.text == Key.CloseBracket) {
+                    root.preview-set-trim-end();
+                    accept
+                } else {
+                    reject
+                }
+            }
         }
 
         // ---- 主体内容 ----
@@ -618,6 +723,14 @@ export component MainWindow inherits Window {
                             // （不是固定 width），行里没人吸收余量时 Slint 会把余量摊给所有
                             // 子元素，标签列就会被撑宽、跟别的行对不齐。
                             Rectangle { horizontal-stretch: 1; }
+                            // 「提取音轨」搭在这行右端。它跟输出格式没关系，靠整段空白隔开、
+                            // 贴住行尾，看着才不会跟格式下拉框混成一组。
+                            Button {
+                                text: strings.button-extract-audio;
+                                tooltip-text: strings.tip-extract-audio;
+                                enabled: !root.encoding;
+                                clicked => { root.extract-audio(); }
+                            }
                         }
 
                         // ---- 编码方式 ----
@@ -711,7 +824,7 @@ export component MainWindow inherits Window {
                         HorizontalLayout {
                             vertical-stretch: 0;
                             spacing: 4px;
-                            TippableLabel { text: strings.label-trim-range; tip: strings.tip-trim-start; min-width: root.label-col-w; horizontal-stretch: 0; vertical-alignment: center; }
+                            TippableLabel { text: strings.label-trim-range; tip: strings.tip-trim; min-width: root.label-col-w; horizontal-stretch: 0; vertical-alignment: center; }
                             TippableLabel { text: strings.label-trim-start; tip: strings.tip-trim-start; vertical-alignment: center; }
                             LineEdit { min-width: 110px; horizontal-stretch: 0; enabled: root.trim-enabled; text <=> root.trim-start-text; tooltip-text: strings.tip-trim-start; }
                             Rectangle { horizontal-stretch: 1; }
@@ -724,10 +837,6 @@ export component MainWindow inherits Window {
                         // ---- 复选项（和上面的标签列左对齐，不再额外缩进） ----
                         HorizontalLayout {
                             CheckBox { vertical-stretch: 0; text: strings.check-scale-up; tooltip-text: strings.tip-scale-up; checked <=> root.scale-up; }
-                            Rectangle { horizontal-stretch: 1; }
-                        }
-                        HorizontalLayout {
-                            CheckBox { vertical-stretch: 0; text: strings.check-extract-audio; tooltip-text: strings.tip-extract-audio; checked <=> root.extract-audio; }
                             Rectangle { horizontal-stretch: 1; }
                         }
 
@@ -881,11 +990,11 @@ export component MainWindow inherits Window {
                     // changed 只在用户操作时触发（app.rs 写属性不会触发），
                     // 所以拿它当"正在拖"的信号是安全的。
                     changed(v) => { root.preview-scrubbing = true; }
-                    released(v) => { root.preview-scrubbing = false; root.preview-seek(v / 1000); }
+                    released(v) => { root.preview-scrubbing = false; root.preview-seek(v / 1000); root.focus-preview-keys(); }
                 }
 
-                // 第一行：当前时间/总时长 | 播放控件 | 当前帧/总帧数
-                // 左右两段文字宽度写死成一样，中间那组图标按钮才是真正居中的
+                // 第一行：当前时间/总时长 | 播放控件 | 音量 静音 | 当前帧/总帧数
+                // 左右两段宽度写死成一样，中间那组图标按钮才是真正居中的
                 // （都用 stretch 的话，两边内容宽度不同，中间就会被挤偏）。
                 HorizontalLayout {
                     spacing: 8px;
@@ -893,7 +1002,7 @@ export component MainWindow inherits Window {
                     vertical-stretch: 0;
 
                     Text {
-                        width: 168px;
+                        width: root.preview-side-w;
                         vertical-alignment: center;
                         horizontal-alignment: left;
                         font-family: "Consolas";
@@ -941,14 +1050,110 @@ export component MainWindow inherits Window {
                         }
                     }
 
-                    Text {
-                        width: 168px;
-                        vertical-alignment: center;
-                        horizontal-alignment: right;
-                        font-family: "Consolas";
-                        font-size: 11px;
-                        color: root.preview-loaded ? Palette.foreground : #909090;
-                        text: root.preview-frame-cur + " / " + root.preview-frame-total;
+                    // 右段：音量条 + 静音键 + 帧数。帧数右对齐贴着面板右边，
+                    // 所以给它 stretch 把余量吃掉，不加多余的占位矩形。
+                    HorizontalLayout {
+                        width: root.preview-side-w;
+                        spacing: 6px;
+
+                        // 音量条包一层：里面要挂一层接鼠标的 TouchArea 和浮出来的
+                        // 数字，这两个都不能直接放进布局（布局会把它们当成要排布的
+                        // 元素）。宽度还是音量条那个宽度，外面看着没差别。
+                        Rectangle {
+                            width: root.volume-slider-w;
+
+                            // 这层只负责画。鼠标事件被上面的 vol-touch 接走了，
+                            // 所以它自己收不到拖动，值由 vol-touch 写进来。
+                            Slider {
+                                width: 100%;
+                                // 高度跟着行高走，不写死 20px。横向布局的交叉轴是按
+                                // stretch 解的，固定高度的元素会被顶到行的上沿，看着
+                                // 比旁边的图标键高一截；撑满行高之后，滑块自己会把
+                                // 轨道和拇指居中。
+                                height: 100%;
+                                value <=> root.preview-volume;
+                                minimum: 0;
+                                maximum: 100;
+                                enabled: root.preview-controls-on;
+                            }
+
+                            // 悬停或拖动时，在音量条上方浮一个数字。x/y 自己算，
+                            // 不占布局的位置。
+                            if (vol-touch.has-hover || root.preview-vol-dragging): Rectangle {
+                                x: (parent.width - self.width) / 2;
+                                y: -self.height - 2px;
+                                width: vol-text.width + 10px;
+                                height: vol-text.height + 4px;
+                                border-radius: 3px;
+                                background: FluentPalette.alternate-background;
+                                border-width: 1px;
+                                border-color: FluentPalette.border;
+
+                                vol-text := Text {
+                                    x: 5px;
+                                    y: 2px;
+                                    text: "\{round(root.preview-volume)}";
+                                    font-family: "Consolas";
+                                    font-size: 11px;
+                                    color: FluentPalette.foreground;
+                                }
+                            }
+
+                            // 盖在滑块上的 TouchArea：一是拿 has-hover 知道鼠标停在
+                            // 音量条上没有（滑块自己的悬停状态外面读不到），二是它
+                            // 盖上去之后滑块就收不到事件了，拖动只能在这里算。
+                            // 拇指宽 20px、中心在 10px..(宽-10px) 之间走，把鼠标的
+                            // x 按这个范围换算成 0..100，取整后和浮出来的数字对得上。
+                            //
+                            // 每动一下要做两件事：改 preview-volume（滑块和浮出来的
+                            // 数字看的是它）和发 preview-set-volume（那段通往 mpv）。
+                            // 拖动期间 app.rs 不回写 preview-volume，光发回调的话
+                            // 滑块会一直停在旧值上。
+                            vol-touch := TouchArea {
+                                enabled: root.preview-controls-on;
+                                // 算一次放这儿，down 和 moved 里都读它
+                                property <float> value-from-x: round(clamp(
+                                    (self.mouse-x - 10px) / (root.volume-slider-w - 20px) * 100,
+                                    0, 100));
+
+                                pointer-event(e) => {
+                                    if (e.kind == PointerEventKind.up
+                                        || e.kind == PointerEventKind.cancel) {
+                                        // cancel 是拖到一半控件被禁用，别把 dragging 卡住
+                                        root.preview-vol-dragging = false;
+                                    } else if (e.kind == PointerEventKind.down
+                                               && e.button == PointerEventButton.left) {
+                                        root.preview-vol-dragging = true;
+                                        root.preview-volume = self.value-from-x;
+                                        root.preview-set-volume(self.value-from-x);
+                                    }
+                                }
+                                // 只在按住时才触发（见 TouchArea.moved 的说明）
+                                moved => {
+                                    root.preview-volume = self.value-from-x;
+                                    root.preview-set-volume(self.value-from-x);
+                                }
+                            }
+                        }
+
+                        IconButton {
+                            icon: root.preview-muted
+                                ? @image-url("icons/volume-muted.svg")
+                                : @image-url("icons/volume.svg");
+                            enabled: root.preview-controls-on;
+                            tooltip-text: root.preview-muted ? strings.button-unmute : strings.button-mute;
+                            clicked => { root.preview-toggle-mute(); }
+                        }
+
+                        Text {
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                            horizontal-alignment: right;
+                            font-family: "Consolas";
+                            font-size: 11px;
+                            color: root.preview-loaded ? Palette.foreground : #909090;
+                            text: root.preview-frame-cur + " / " + root.preview-frame-total;
+                        }
                     }
                 }
 
@@ -964,14 +1169,14 @@ export component MainWindow inherits Window {
                         text: strings.button-set-start;
                         enabled: root.preview-controls-on;
                         tooltip-text: strings.tip-set-start;
-                        clicked => { root.preview-set-trim-start(); }
+                        clicked => { root.preview-set-trim-start(); root.focus-preview-keys(); }
                     }
 
                     Button {
                         text: strings.button-set-end;
                         enabled: root.preview-controls-on;
                         tooltip-text: strings.tip-set-end;
-                        clicked => { root.preview-set-trim-end(); }
+                        clicked => { root.preview-set-trim-end(); root.focus-preview-keys(); }
                     }
 
                     // 空白：把后面那组输入框顶到右端
@@ -1001,7 +1206,7 @@ export component MainWindow inherits Window {
                         text: strings.button-jump;
                         enabled: root.preview-controls-on;
                         tooltip-text: strings.tip-jump;
-                        clicked => { root.preview-jump-to-input(); }
+                        clicked => { root.preview-jump-to-input(); root.focus-preview-keys(); }
                     }
                 }
             }

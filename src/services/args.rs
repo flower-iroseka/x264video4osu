@@ -6,8 +6,7 @@
 //! - 展示串（`display_*`）：逐字复刻旧程序拼出的命令行文本，用于 `[CMD] ffmpeg {args}` 日志。
 
 use crate::error::{AppError, AppResult};
-use crate::services::audio::{self, AudioMode, AAC_BITRATE_KBPS};
-use crate::services::ffmpeg::probe_audio_codec;
+use crate::services::audio::{self, AudioMode};
 use crate::services::format::OutputFormat;
 use crate::services::pathutil::{escape_path_argument, full_path, validate_path};
 use crate::services::scale::build_scale;
@@ -23,7 +22,6 @@ pub struct EncodeInput {
     pub width_text: String,
     pub height_text: String,
     pub scale_up: bool,
-    pub extract_audio: bool,
     /// 0 = 无音频，1 = 复制音频流，2 = 转码音频
     pub audio_mode_index: i32,
     /// 0 = AAC，1 = FLAC（仅 mp4）
@@ -35,32 +33,34 @@ pub struct EncodeInput {
     /// 是否忽略视频轨的 edit list（只编一遍）。"战渣浪"那类文件的视频轨被 edit list
     /// 整段复制过，ffmpeg 默认照着编两遍，这个开关让它只编一遍。
     pub ignore_editlist: bool,
-    /// 进度用的总时长（秒）；None = 由 ffprobe 现场探测。见 `EncodePlan::duration_override`。
+    /// 进度用的总时长（秒）；None = 由 ffmpeg 现场探测。见 `EncodePlan::duration_override`。
     pub duration_override: Option<f64>,
 }
 
 /// 构建完成的编码方案
 pub struct EncodePlan {
-    /// 执行用 token（2pass 的 pass1；CRF 模式下为空向量）
+    /// 执行用 token（2pass 的 pass1；CRF 模式和纯音频模式下为空向量）
     pub pass1: Vec<String>,
     /// 执行用 token（实际编码）
     pub pass2: Vec<String>,
-    /// 可选的音轨提取 token
-    pub audio_extract: Option<Vec<String>>,
     /// 展示用命令行文本
     pub display_pass1: String,
     pub display_pass2: String,
-    pub display_audio: String,
     /// 最终输出路径
     pub output: std::path::PathBuf,
+    /// 这次只提取音轨、不编视频（由 `build_audio_extract` 产出的方案）。
+    ///
+    /// 为真时 `pass2` 就是那条提取命令、`output` 是提取出来的音频文件，
+    /// `run_encoding` 不会再去找视频那两遍，日志里的措辞也跟着换。
+    pub audio_only: bool,
     /// 2pass 日志的绝对路径基名（不含 ffmpeg 自己加的 `-0` 后缀）；CRF 模式下为 None。
     ///
     /// 清理临时文件要用这个而不是输出目录：passlogfile 传的是绝对路径，文件落在
     /// 应用的当前目录，不在输出文件旁边。
     pub log_file_path: Option<std::path::PathBuf>,
-    /// 进度用的总时长（秒）；None = 由 ffprobe 现场探测。
+    /// 进度用的总时长（秒）；None = 由 ffmpeg 现场探测。
     ///
-    /// 视频轨被 edit list 复制、用户又选了编两遍时，ffprobe 报的只是容器声明的那一遍，
+    /// 视频轨被 edit list 复制、用户又选了编两遍时，探测到的只是容器声明的那一遍，
     /// 得用编辑区间算出来的实际长度覆盖，否则进度条会提前跑到 100%、ETA 全是 0。
     pub duration_override: Option<f64>,
     /// 裁剪区间（秒）。`-ss`/`-to` 都是输入侧选项，ffmpeg 的 `time=` 只覆盖这一段，
@@ -84,6 +84,33 @@ fn parse_int(s: &str) -> i32 {
     s.trim().parse().unwrap_or(0)
 }
 
+/// CRF 的默认值，也是输入不合法时的兜底。
+///
+/// 跟界面上 CRF 框的初始文本（`ui/main.slint` 里的 `value-text`）保持一致，
+/// 这样解析失败时的取值和用户看到的那个数不会对不上。
+pub const DEFAULT_CRF: f64 = 26.0;
+
+/// 解析 CRF 输入框里的值。
+///
+/// 必须按浮点解析：ffmpeg 的 `-crf` 选项本身就是 FLOAT，x264 也收小数，
+/// 18.5 这种写法是合法的。以前这里按 `i32` 解析，"18.5" 解析失败返回 0，
+/// 而 0 又正好落在合法区间里，于是静默变成了 CRF 0（无损）；再配上写死的
+/// `-profile:v high`，x264 直接报 "high profile doesn't support lossless"。
+///
+/// **下限是 1 不是 0**：命令行里的 `-profile:v high` 是固定的，0（无损）配 high
+/// 档 x264 必定开不了编码器，实测报 "Could not open encoder before EOF"，
+/// 用户只会看到一句看不懂的 "Conversion failed!"。所以 0 也归到「填错了」那一类，
+/// 按默认值走。
+///
+/// 解析不了（空串、打错字、小数点打成逗号）或落在 1..=51 之外，一律退回默认值。
+/// 这个兜底和别的输入框一致：填错了不报错，按默认值走。
+pub fn crf_from_text(text: &str) -> f64 {
+    match text.trim().parse::<f64>() {
+        Ok(v) if (1.0..=51.0).contains(&v) => v,
+        _ => DEFAULT_CRF,
+    }
+}
+
 /// 等价于 .NET `Path.ChangeExtension(path, ".ext")`：替换当前扩展名；没有则追加。
 fn change_extension(path: &std::path::Path, new_ext: &str) -> std::path::PathBuf {
     let trimmed = new_ext.trim_start_matches('.');
@@ -98,6 +125,37 @@ fn combine(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
     dir.join(filename)
 }
 
+/// 目标路径已经存在时，在文件名后面加 `(1)`、`(2)`… 直到不撞车，返回可用的那个。
+///
+/// 基准名固定取传进来的路径，所以对已经带后缀的名字也成立：`xxx_audio.m4a`
+/// 撞车时试出来的是 `xxx_audio(1).m4a`，不会叠成 `xxx_audio(1)(2).m4a`。
+/// 旧程序是直接覆盖，这里改成另存一份。
+fn unique_output_path(candidate: std::path::PathBuf) -> std::path::PathBuf {
+    if !candidate.exists() {
+        return candidate;
+    }
+    let dir = candidate
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let stem = candidate
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext_part = match candidate.extension() {
+        Some(e) => format!(".{}", e.to_string_lossy()),
+        None => String::new(),
+    };
+
+    let mut index = 1u32;
+    let mut path = candidate;
+    while path.exists() {
+        path = dir.join(format!("{stem}({index}){ext_part}"));
+        index += 1;
+    }
+    path
+}
+
 /// 构建 FFmpeg 编码方案。任何一步失败都会把错误带回上层（与旧程序抛异常一致）。
 pub fn build(input: EncodeInput) -> AppResult<EncodePlan> {
     let value_box = parse_int(&input.value_text);
@@ -109,17 +167,15 @@ pub fn build(input: EncodeInput) -> AppResult<EncodePlan> {
 
     // 根据模式设置值
     let mut bitrate = 800i32;
-    let mut crf = 23i32;
+    let mut crf = DEFAULT_CRF;
     if is_two_pass {
         // 2pass 模式：valueBox 是比特率
         if value_box > 0 {
             bitrate = value_box;
         }
     } else {
-        // CRF 模式：valueBox 是 CRF 值
-        if (0..=51).contains(&value_box) {
-            crf = value_box;
-        }
+        // CRF 模式：valueBox 是 CRF 值（可以是小数，见 crf_from_text）
+        crf = crf_from_text(&input.value_text);
     }
 
     let input_text = input.input_text.trim();
@@ -158,32 +214,10 @@ pub fn build(input: EncodeInput) -> AppResult<EncodePlan> {
             .ok_or_else(|| AppError::InvalidArgument("Invalid output path.".into()))?
     };
     // 确保输出扩展名与所选格式一致
-    let mut output = change_extension(&output_raw, format.extension());
+    let output_raw = change_extension(&output_raw, format.extension());
 
     // 输出文件已存在时自动追加 (1)、(2)… 后缀，直到名字不冲突（新增强，旧程序会直接覆盖）。
-    // 基准名固定取自首次算出的路径，避免对 (1) 再次加后缀形成 (1)(2)。
-    let output_dir = output
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_default();
-    let output_stem = output
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let output_ext = output
-        .extension()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let ext_part = if output_ext.is_empty() {
-        String::new()
-    } else {
-        format!(".{output_ext}")
-    };
-    let mut dup_index = 1u32;
-    while output.exists() {
-        output = output_dir.join(format!("{output_stem}({dup_index}){ext_part}"));
-        dup_index += 1;
-    }
+    let output = unique_output_path(output_raw);
 
     // 日志文件名（仅 2pass 需要）- 使用 GUID 避免冲突
     let log_file_name = if is_two_pass {
@@ -193,7 +227,9 @@ pub fn build(input: EncodeInput) -> AppResult<EncodePlan> {
     };
 
     let maxrate = format!("{bitrate}k");
-    let bufsize = format!("{}k", bitrate * 2);
+    // saturating_mul：bitrate 直接来自用户输入，填一个上十亿的数会在 debug 构建里
+    // 把这里乘成溢出 panic（release 下回绕成负数，变成 `-bufsize -294967296k`）
+    let bufsize = format!("{}k", bitrate.saturating_mul(2));
 
     // ---------- 裁剪区间 ----------
     // -ss/-to 都放在 -i 前面（输入侧）：直接对应界面上的起点和终点，不用自己算时长。
@@ -362,74 +398,153 @@ pub fn build(input: EncodeInput) -> AppResult<EncodePlan> {
     };
 
     // ---------- 音轨提取参数 ----------
-    let (audio_extract, display_audio) = if input.extract_audio {
-        let dir = output
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_default();
-        let stem = output
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let audio_output = combine(&dir, &format!("{stem}_audio.m4a"));
-        let audio_str = audio_output.to_string_lossy().into_owned();
-
-        // m4a（ipod muxer）只装得下 aac / alac / ac3。别的编码直接复制会报
-        // "Could not find tag for codec ... in stream" 然后写出一个 0 字节文件
-        // —— 实测 opus、vorbis、flac、mp3、pcm 都不行。所以源码流不在名单里时
-        // 转成 AAC，宁可重编码也不要失败。探不到编码（没有音轨、ffprobe 出错）
-        // 时按可复制处理，保持旧行为。
-        let source_codec = probe_audio_codec(&input_full.to_string_lossy());
-        let copyable = match source_codec.as_deref() {
-            Some(c) => matches!(c, "aac" | "alac" | "ac3"),
-            None => true,
-        };
-        let codec_tokens: Vec<String> = if copyable {
-            vec!["-c:a".into(), "copy".into()]
-        } else {
-            vec![
-                "-c:a".into(),
-                "aac".into(),
-                "-b:a".into(),
-                format!("{AAC_BITRATE_KBPS}k"),
-            ]
-        };
-        let codec_display = codec_tokens.join(" ");
-
-        // 音轨与视频用同一个裁剪区间，导出的音频和裁过的视频对得上。
-        let mut tokens: Vec<String> = vec!["-y".into()];
-        if let Some(s) = input.trim_start_secs {
-            tokens.push("-ss".into());
-            tokens.push(format!("{s:.3}"));
-        }
-        if let Some(e) = input.trim_end_secs {
-            tokens.push("-to".into());
-            tokens.push(format!("{e:.3}"));
-        }
-        tokens.push("-i".into());
-        tokens.push(input_full.to_string_lossy().into_owned());
-        tokens.push("-vn".into());
-        tokens.extend(codec_tokens);
-        tokens.push(audio_str);
-        let display = format!(
-            "-y {trim_display}-i {escaped_input} -vn {codec_display} {}",
-            escape_path_argument(&audio_output.to_string_lossy())
-        );
-        (Some(tokens), display)
-    } else {
-        (None, String::new())
-    };
+    // 提取音轨 3.1 起是独立的一次运行（`build_audio_extract`），不再跟着视频一起编。
 
     Ok(EncodePlan {
         pass1,
         pass2,
-        audio_extract,
         display_pass1,
         display_pass2,
-        display_audio,
         output,
+        audio_only: false,
         log_file_path,
         duration_override: input.duration_override,
+        trim_start_secs: input.trim_start_secs,
+        trim_end_secs: input.trim_end_secs,
+    })
+}
+
+/// 「提取音轨」按钮要用的输入。和 `EncodeInput` 分开：这一步不编视频，
+/// CRF、分辨率、格式这些一个都用不上。
+pub struct AudioExtractInput {
+    pub input_text: String,
+    /// 输出框里那个视频输出路径，可能为空。只用来决定音频放哪儿、叫什么。
+    pub output_text: String,
+    /// 裁剪区间（秒），跟视频编码用的是同一份
+    pub trim_start_secs: Option<f64>,
+    pub trim_end_secs: Option<f64>,
+    /// 源文件第一条音频流的编码名。调用方从探测结果里带进来。
+    /// None = 整个探测都没成功。音频照复制，扩展名按 `audio_container_ext` 兜底成 mka。
+    pub source_audio_codec: Option<String>,
+}
+
+/// 源音频编码 → 提取出来那个文件用什么扩展名。
+///
+/// 提取固定 `-c:a copy`，容器装不下源编码时 ffmpeg 会报
+/// "Could not find tag for codec ... in stream"，然后写出一个 0 字节文件，
+/// 所以扩展名得跟着编码走：
+///
+/// - aac / alac 本来就是 MP4 家族的，装 m4a 最合适；
+/// - opus / vorbis 走 ogg（opus 单独存成 `.opus` 也行，但 ogg 更常见）；
+/// - mp3、flac、ac3、eac3、pcm 各有自己的容器，直接用同名扩展名；
+/// - 认不出来的编码给 mka —— Matroska 基本什么都装得下，宁可给个不那么好看的
+///   扩展名，也好过因为容器挑错而吐出个空文件。
+///
+/// 探不到编码（整个探测都失败了）同样落到 mka。
+fn audio_container_ext(codec: Option<&str>) -> &'static str {
+    match codec {
+        Some("aac") | Some("alac") => "m4a",
+        Some("opus") | Some("vorbis") => "ogg",
+        Some("mp3") => "mp3",
+        Some("flac") => "flac",
+        Some("ac3") => "ac3",
+        Some("eac3") => "eac3",
+        Some(c) if c.starts_with("pcm_") => "wav",
+        _ => "mka",
+    }
+}
+
+/// 构建「只提取音轨」的方案。
+///
+/// 产出的 `EncodePlan` 里 `audio_only` 为真、`pass2` 就是那条 ffmpeg 命令、
+/// `output` 是提取出来的音频文件（不是视频输出）。`run_encoding` 认这三个字段，
+/// 视频那几遍一律不走。
+pub fn build_audio_extract(input: AudioExtractInput) -> AppResult<EncodePlan> {
+    let input_text = input.input_text.trim();
+    if input_text.is_empty() {
+        return Err(AppError::InvalidArgument("Input path cannot be empty.".into()));
+    }
+    if !validate_path(input_text) || !std::path::Path::new(input_text).exists() {
+        return Err(AppError::InputFileNotFound("Input file not found or invalid.".into()));
+    }
+    let input_full = full_path(input_text)
+        .ok_or_else(|| AppError::InvalidArgument("Invalid input path.".into()))?;
+
+    // 音频放哪儿、叫什么：输出框填了就跟它同目录、用它的文件名（去掉扩展名）；
+    // 没填就放源文件旁边、用源文件名。两种都不带视频格式的扩展名 ——
+    // 这一步不生成视频，`xxx_output.mp4` 那种名字在这儿没有意义。
+    let out_text = input.output_text.trim();
+    let (dir, stem) = if out_text.is_empty() {
+        let dir = input_full
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        let stem = input_full
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        (dir, stem)
+    } else {
+        let out_full = full_path(out_text)
+            .ok_or_else(|| AppError::InvalidArgument("Invalid output path.".into()))?;
+        let dir = out_full
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        // 输出目录不存在（用户手填的路）就建出来，和 `build` 里对视频输出的处理一致
+        if !dir.as_os_str().is_empty() && !dir.exists() {
+            std::fs::create_dir_all(&dir).map_err(AppError::Io)?;
+        }
+        let stem = out_full
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        (dir, stem)
+    };
+    let ext = audio_container_ext(input.source_audio_codec.as_deref());
+    let audio_output = unique_output_path(combine(&dir, &format!("{stem}_audio.{ext}")));
+    let audio_str = audio_output.to_string_lossy().into_owned();
+
+    // 一律直接复制音频流。提取出来的音频和源文件里的是同一份数据，编码、码率、
+    // 声道一个都不动。
+    const CODEC_ARGS: [&str; 2] = ["-c:a", "copy"];
+
+    // -ss/-to 跟视频编码一样排在 -i 前面：勾了「裁剪视频」时，导出的音频和裁过的
+    // 视频是同一段。
+    let mut trim_display = String::new();
+    let mut tokens: Vec<String> = vec!["-y".into()];
+    if let Some(s) = input.trim_start_secs {
+        tokens.push("-ss".into());
+        tokens.push(format!("{s:.3}"));
+        trim_display.push_str(&format!("-ss {s:.3} "));
+    }
+    if let Some(e) = input.trim_end_secs {
+        tokens.push("-to".into());
+        tokens.push(format!("{e:.3}"));
+        trim_display.push_str(&format!("-to {e:.3} "));
+    }
+    tokens.push("-i".into());
+    tokens.push(input_full.to_string_lossy().into_owned());
+    tokens.push("-vn".into());
+    tokens.extend(CODEC_ARGS.map(String::from));
+    tokens.push(audio_str.clone());
+
+    let display = format!(
+        "-y {trim_display}-i {} -vn {} {}",
+        escape_path_argument(&input_full.to_string_lossy()),
+        CODEC_ARGS.join(" "),
+        escape_path_argument(&audio_str)
+    );
+
+    Ok(EncodePlan {
+        pass1: Vec::new(),
+        pass2: tokens,
+        display_pass1: String::new(),
+        display_pass2: display,
+        output: audio_output,
+        audio_only: true,
+        log_file_path: None,
+        duration_override: None,
         trim_start_secs: input.trim_start_secs,
         trim_end_secs: input.trim_end_secs,
     })
@@ -457,13 +572,35 @@ mod tests {
             width_text: "0".into(),
             height_text: "720".into(),
             scale_up: false,
-            extract_audio: false,
             audio_mode_index: 0,
             audio_codec_index: 0,
             trim_start_secs: None,
             trim_end_secs: None,
             ignore_editlist: false,
             duration_override: None,
+        }
+    }
+
+    /// 提取音轨的输入，默认拿 `base_input` 那个假文件当源。
+    /// 源编码按最常见的 aac 填（提取出来是 .m4a）；扩展名那条规则另有测试。
+    fn base_audio_input() -> AudioExtractInput {
+        AudioExtractInput {
+            input_text: temp_input().to_string_lossy().into_owned(),
+            output_text: String::new(),
+            trim_start_secs: None,
+            trim_end_secs: None,
+            source_audio_codec: Some("aac".into()),
+        }
+    }
+
+    /// 清掉去重测试上一轮留下的产物（断言挂掉时收尾那段不会执行）。
+    fn clear_dedup_leftovers(base: &str) {
+        for suffix in ["", "(1)", "(2)"] {
+            for ext in ["mp4", "m4a", "mka"] {
+                let _ = std::fs::remove_file(crate::testutil::scratch_path(&format!(
+                    "{base}{suffix}.{ext}"
+                )));
+            }
         }
     }
 
@@ -539,9 +676,20 @@ mod tests {
     fn crf_invalid_value_falls_back_to_default() {
         let mut i = base_input();
         i.mode_index = 0;
-        i.value_text = "99".into(); // 超出 0..=51
+        i.value_text = "99".into(); // 超出 1..=51
         let plan = build(i).unwrap();
-        assert!(plan.pass2.windows(2).any(|w| w[0] == "-crf" && w[1] == "23"));
+        assert!(plan.pass2.windows(2).any(|w| w[0] == "-crf" && w[1] == "26"));
+    }
+
+    #[test]
+    fn crf_zero_falls_back_to_default() {
+        // 0 是无损，但命令行里的 `-profile:v high` 是写死的，x264 开不了编码器。
+        // 与其放过去让 ffmpeg 报一句看不懂的错，不如按默认值走。
+        let mut i = base_input();
+        i.mode_index = 0;
+        i.value_text = "0".into();
+        let plan = build(i).unwrap();
+        assert!(plan.pass2.windows(2).any(|w| w[0] == "-crf" && w[1] == "26"));
     }
 
     #[test]
@@ -551,6 +699,26 @@ mod tests {
         i.value_text = "20".into();
         let plan = build(i).unwrap();
         assert!(plan.pass2.windows(2).any(|w| w[0] == "-crf" && w[1] == "20"));
+    }
+
+    #[test]
+    fn crf_decimal_value_used() {
+        // x264 的 crf 是浮点，小数要原样传下去。
+        // 以前按 i32 解析，"18.5" 会落到 0，变成无损，配上 high profile 直接失败。
+        let mut i = base_input();
+        i.mode_index = 0;
+        i.value_text = "18.5".into();
+        let plan = build(i).unwrap();
+        assert!(plan.pass2.windows(2).any(|w| w[0] == "-crf" && w[1] == "18.5"));
+    }
+
+    #[test]
+    fn crf_unparsable_text_falls_back_to_default() {
+        let mut i = base_input();
+        i.mode_index = 0;
+        i.value_text = "二十三".into();
+        let plan = build(i).unwrap();
+        assert!(plan.pass2.windows(2).any(|w| w[0] == "-crf" && w[1] == "26"));
     }
 
     #[test]
@@ -579,29 +747,153 @@ mod tests {
 
     #[test]
     fn audio_extract_built() {
-        let mut i = base_input();
-        i.extract_audio = true;
-        let plan = build(i).unwrap();
-        let audio = plan.audio_extract.unwrap();
-        // 探不到源编码（测试用的是假文件）时按可复制处理
-        assert!(audio.windows(2).any(|w| w[0] == "-c:a" && w[1] == "copy"));
-        assert!(plan.display_audio.starts_with("-y "));
+        let plan = build_audio_extract(base_audio_input()).unwrap();
+        assert!(plan.pass2.windows(2).any(|w| w[0] == "-c:a" && w[1] == "copy"));
+        assert!(plan.pass2.iter().any(|t| t == "-vn"));
+        assert!(plan.display_pass2.starts_with("-y "));
+        assert!(plan.audio_only, "提取音轨的方案必须标成纯音频");
+        assert!(plan.pass1.is_empty(), "提取音轨不编视频，没有第一遍");
+        assert_eq!(plan.output.extension().unwrap(), "m4a");
+    }
+
+    /// 提取一律 `-c:a copy`，不再往 AAC 转。转码是以前 m4a 装不下源编码时的兜底，
+    /// 改成按编码挑容器之后就没有必要了 —— 重编码等于白白丢掉音质。
+    #[test]
+    fn audio_extract_always_copies_the_stream() {
+        for codec in [None, Some("aac"), Some("opus"), Some("mp3"), Some("flac")] {
+            let mut i = base_audio_input();
+            i.source_audio_codec = codec.map(|c| c.to_string());
+            let plan = build_audio_extract(i).unwrap();
+            assert!(
+                plan.pass2.windows(2).any(|w| w[0] == "-c:a" && w[1] == "copy"),
+                "{codec:?} 源应当直接复制，实际: {:?}",
+                plan.pass2
+            );
+            assert!(
+                !plan.pass2.iter().any(|t| t == "-b:a"),
+                "{codec:?} 直接复制不该带码率参数"
+            );
+            assert!(
+                plan.display_pass2.contains("-c:a copy"),
+                "display: {}",
+                plan.display_pass2
+            );
+        }
+    }
+
+    /// 扩展名跟着源编码走。这张表拍错了 ffmpeg 会报
+    /// "Could not find tag for codec ... in stream"，然后写出一个 0 字节文件。
+    #[test]
+    fn audio_extract_extension_follows_source_codec() {
+        let ext_for = |codec: Option<&str>| {
+            let mut i = base_audio_input();
+            i.source_audio_codec = codec.map(|c| c.to_string());
+            build_audio_extract(i)
+                .unwrap()
+                .output
+                .extension()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        assert_eq!(ext_for(Some("aac")), "m4a");
+        assert_eq!(ext_for(Some("alac")), "m4a");
+        assert_eq!(ext_for(Some("opus")), "ogg");
+        assert_eq!(ext_for(Some("vorbis")), "ogg");
+        assert_eq!(ext_for(Some("mp3")), "mp3");
+        assert_eq!(ext_for(Some("flac")), "flac");
+        assert_eq!(ext_for(Some("ac3")), "ac3");
+        assert_eq!(ext_for(Some("eac3")), "eac3");
+        assert_eq!(ext_for(Some("pcm_s16le")), "wav");
+        assert_eq!(ext_for(Some("pcm_f32le")), "wav");
+        // 认不出来的编码、以及完全没探到编码，都丢给 mka 兜底
+        assert_eq!(ext_for(Some("dts")), "mka");
+        assert_eq!(ext_for(None), "mka");
+    }
+
+    /// 输出框填了就跟它同目录、用它的文件名；没填就放源文件旁边、用源文件名。
+    #[test]
+    fn audio_extract_names_output_after_the_output_box() {
+        let mut i = base_audio_input();
+        i.output_text = crate::testutil::scratch_path("song_video.mp4")
+            .to_string_lossy()
+            .into_owned();
+        let plan = build_audio_extract(i).unwrap();
+        assert_eq!(plan.output.file_name().unwrap(), "song_video_audio.m4a");
+
+        let plan = build_audio_extract(base_audio_input()).unwrap();
+        assert_eq!(plan.output.file_name().unwrap(), "args_fake_input_audio.m4a");
+    }
+
+    /// 提取出来的音频重名时也要另存，不能把上一次的结果盖掉。
+    #[test]
+    fn audio_extract_output_is_deduplicated() {
+        // 用自己的一份假输入：几个测试并行跑，共用一个名字会让「(1) 在不在」
+        // 取决于别人有没有先写文件，断言就会时对时错。
+        let src = crate::testutil::scratch_path("args_dedup_audio.mkv");
+        std::fs::write(&src, b"fake").unwrap();
+        // 上一次跑挂在断言上时留下的产物要清掉，否则这次进来就已经有 (1) 了
+        clear_dedup_leftovers("args_dedup_audio_audio");
+        let make = || AudioExtractInput {
+            input_text: src.to_string_lossy().into_owned(),
+            output_text: String::new(),
+            trim_start_secs: None,
+            trim_end_secs: None,
+            source_audio_codec: Some("aac".into()),
+        };
+
+        let first = build_audio_extract(make()).unwrap();
+        assert_eq!(first.output.file_name().unwrap(), "args_dedup_audio_audio.m4a");
+        std::fs::write(&first.output, b"existing audio").unwrap();
+
+        let second = build_audio_extract(make()).unwrap();
+        assert_eq!(second.output.file_name().unwrap(), "args_dedup_audio_audio(1).m4a");
+
+        let _ = std::fs::remove_file(&first.output);
+    }
+
+    /// 视频输出同样要另存。基准名取第一次算出来的路径，不会叠成 (1)(1)。
+    #[test]
+    fn video_output_is_deduplicated() {
+        let src = crate::testutil::scratch_path("args_dedup_video.mkv");
+        std::fs::write(&src, b"fake").unwrap();
+        clear_dedup_leftovers("args_dedup_video_output");
+        let make = || {
+            let mut i = base_input();
+            i.input_text = src.to_string_lossy().into_owned();
+            i.format_index = 2; // mp4
+            i
+        };
+
+        let first = build(make()).unwrap();
+        assert_eq!(first.output.file_name().unwrap(), "args_dedup_video_output.mp4");
+        std::fs::write(&first.output, b"existing video").unwrap();
+
+        let second = build(make()).unwrap();
+        assert_eq!(second.output.file_name().unwrap(), "args_dedup_video_output(1).mp4");
+        std::fs::write(&second.output, b"existing video").unwrap();
+
+        // 再撞一次：基准名仍是 args_dedup_video_output，取下一个空位 (2)，不是 (1)(1)
+        let third = build(make()).unwrap();
+        assert_eq!(third.output.file_name().unwrap(), "args_dedup_video_output(2).mp4");
+
+        let _ = std::fs::remove_file(&first.output);
+        let _ = std::fs::remove_file(&second.output);
     }
 
     /// ffmpeg 会停下来问 "Overwrite? [y/N]"，而它的 stdin 是管道，没人回答，
-    /// 于是整个编码卡死。三个命令都得带 `-y`。
+    /// 于是整个编码卡死。三条命令都得带 `-y`。
     #[test]
     fn all_commands_force_overwrite() {
         let mut i = base_input();
-        i.mode_index = 1; // 2pass，三条命令都会生成
-        i.extract_audio = true;
+        i.mode_index = 1; // 2pass，两遍都要 -y
         let plan = build(i).unwrap();
         assert_eq!(plan.pass1.first().map(String::as_str), Some("-y"));
         assert_eq!(plan.pass2.first().map(String::as_str), Some("-y"));
-        assert_eq!(
-            plan.audio_extract.unwrap().first().map(String::as_str),
-            Some("-y")
-        );
+
+        let audio = build_audio_extract(base_audio_input()).unwrap();
+        assert_eq!(audio.pass2.first().map(String::as_str), Some("-y"));
     }
 
     // ---------- 音频模式 ----------
@@ -731,16 +1023,14 @@ mod tests {
 
     #[test]
     fn audio_extract_is_trimmed() {
-        let mut i = base_input();
-        i.extract_audio = true;
+        let mut i = base_audio_input();
         i.trim_start_secs = Some(4.0);
         i.trim_end_secs = Some(6.0);
-        let plan = build(i).unwrap();
-        let audio = plan.audio_extract.unwrap();
-        assert_eq!(value_of(&audio, "-ss").unwrap(), "4.000");
-        assert_eq!(value_of(&audio, "-to").unwrap(), "6.000");
-        let ss = pos(&audio, "-ss").unwrap();
-        let input = pos(&audio, "-i").unwrap();
+        let tokens = build_audio_extract(i).unwrap().pass2;
+        assert_eq!(value_of(&tokens, "-ss").unwrap(), "4.000");
+        assert_eq!(value_of(&tokens, "-to").unwrap(), "6.000");
+        let ss = pos(&tokens, "-ss").unwrap();
+        let input = pos(&tokens, "-i").unwrap();
         assert!(ss < input);
     }
 
@@ -784,11 +1074,12 @@ mod tests {
     fn ignore_editlist_not_in_audio_extract() {
         let mut i = base_input();
         i.ignore_editlist = true;
-        i.extract_audio = true;
-        let plan = build(i).unwrap();
-        let audio = plan.audio_extract.expect("audio extract tokens");
-        assert!(!audio.iter().any(|t| t == "-ignore_editlist"));
-        assert!(!plan.display_audio.contains("-ignore_editlist"));
+        let video = build(i).unwrap();
+        assert!(video.pass2.iter().any(|t| t == "-ignore_editlist"));
+
+        let audio = build_audio_extract(base_audio_input()).unwrap();
+        assert!(!audio.pass2.iter().any(|t| t == "-ignore_editlist"));
+        assert!(!audio.display_pass2.contains("-ignore_editlist"));
     }
 
     #[test]

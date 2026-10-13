@@ -9,11 +9,17 @@ Cargo.lock.orig
 log_*.log
 log_*.log.mbtree
 
-# Release bundle (built artifacts, ffmpeg/ffprobe are large binaries)
+# Release bundle (built artifacts, ffmpeg/libmpv are large binaries)
 /release
 
-# 随程序分发的 ffmpeg / ffprobe（几十 MB 的二进制，不进版本库）
+# 随程序分发的 ffmpeg / libmpv（几十 MB 的二进制，不进版本库）
 /tools
+
+# 程序设置在 exe 旁边就地生成，不进版本库
+settings.ini
+
+# 已经用不上的旧工具（ffprobe.exe 之类），放着备查，但不进版本库
+/unused-tools
 
 # 一次性测试目录：跑测试时自动重建，里面的截图和临时素材不用管
 /tests-001

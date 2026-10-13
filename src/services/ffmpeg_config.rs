@@ -1,4 +1,4 @@
-//! FFmpeg / ffprobe 工具定位与校验（对应旧程序 Services/FfmpegConfig.cs）。
+//! FFmpeg 工具定位与校验（对应旧程序 Services/FfmpegConfig.cs）。
 
 use crate::error::{AppError, AppResult};
 use std::path::PathBuf;
@@ -41,10 +41,6 @@ pub fn ffmpeg_path() -> PathBuf {
     tool_path("ffmpeg.exe")
 }
 
-pub fn ffprobe_path() -> PathBuf {
-    tool_path("ffprobe.exe")
-}
-
 pub fn download_url() -> &'static str {
     FFMPEG_DOWNLOAD_URL
 }
@@ -52,15 +48,8 @@ pub fn download_url() -> &'static str {
 /// 校验工具是否存在，缺失时返回带缺失清单的错误（对应 `ValidateTools` 抛
 /// `FileNotFoundException`，消息包含 `• ffmpeg.exe\n`）。
 pub fn validate_tools() -> AppResult<()> {
-    let mut missing = String::new();
-    if !ffmpeg_path().exists() {
-        missing.push_str("• ffmpeg.exe\n");
+    if ffmpeg_path().exists() {
+        return Ok(());
     }
-    if !ffprobe_path().exists() {
-        missing.push_str("• ffprobe.exe\n");
-    }
-    if !missing.is_empty() {
-        return Err(AppError::ToolsMissing(missing));
-    }
-    Ok(())
+    Err(AppError::ToolsMissing("• ffmpeg.exe\n".into()))
 }

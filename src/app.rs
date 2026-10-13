@@ -7,13 +7,14 @@
 use crate::error::AppError;
 use crate::i18n::{self, Lang, Strings};
 use crate::platform::time;
-use crate::services::args::{build, EncodeInput};
-use crate::services::ffmpeg::{
-    cleanup_temp_files_public, Event, FfmpegService, RepeatedTimeline,
-};
+use crate::services::args::{build, build_audio_extract, crf_from_text, AudioExtractInput, EncodeInput};
+use crate::services::ffmpeg::{cleanup_temp_files_public, Event, FfmpegService};
 use crate::services::format::OutputFormat;
+use crate::services::frame_cache::FrameCache;
 use crate::services::pathutil::{full_path, validate_path};
 use crate::services::preview::{self, Preview};
+use crate::services::probe::{self, Framing, Probe, RepeatedTimeline};
+use crate::services::probe_service::{ProbeEvent, ProbeService};
 use crate::services::settings::{self, AppSettings};
 use crate::services::trim;
 use slint::{ComponentHandle, SharedString, Timer, TimerMode, VecModel};
@@ -21,10 +22,79 @@ use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::{Rc, Weak};
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ---------- 项目链接（对应旧程序 AppConfig；GitHubIssuesUrl 在旧程序中未被使用） ----------
 const REPO_URL: &str = "https://github.com/flower-iroseka/x264video4osu";
+
+/// 探测超过这个时长还没结束就弹进度框。
+///
+/// 实测探测有约 156 ms 的进程启动底价，之后每 MB 约 1.6 ms——典型的 osu! 背景
+/// 视频（几 MB 到几十 MB）两三百毫秒就完事，走不到这一步。真要看框的是几百 MB
+/// 到几 GB 的长视频。
+const PROBE_DIALOG_DELAY: Duration = Duration::from_millis(400);
+
+/// `probe::probe` 里拆包建帧表那一段从 36% 起。进度到这个值，说明一级筛子已经
+/// 判定可疑 VFR，正在做唯一需要用户等的事——这时也弹框。
+const PROBE_TABLE_STAGE_PERCENT: u8 = probe::VFR_TABLE_STAGE_PERCENT;
+
+/// 探测的总超时。卡住的 ffmpeg 不能把主窗口永久锁着。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 查探测结果的三种下场。
+enum ProbeLookup {
+    Ready(std::sync::Arc<Probe>),
+    /// 已经请了后台探测，等结果
+    Pending,
+    /// 探不了（文件不存在、打不开），别等了
+    Unavailable,
+}
+
+/// 用户在等探测结果时点下的那个操作。探测落地后按它接着往下走。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingAction {
+    /// 没有等着的操作
+    None,
+    StartEncode,
+    ExtractAudio,
+}
+
+/// 一次后台探测的进行状态。
+struct ProbeJob {
+    path: String,
+    started: Instant,
+    /// 探测进度 0..=100
+    percent: u8,
+    /// 结果到了之后要接着往下走的那个操作（用户点它的时候探测还没好，被拦下了）
+    pending: PendingAction,
+    /// 已弹出的进度框。None = 还没弹（探测够快的话根本不会弹）
+    dialog: Option<ProbeDialog>,
+}
+
+/// 弹出来的进度框。持有 `ModalState` 不放 —— 一放手主窗口就恢复可交互了。
+struct ProbeDialog {
+    dialog: crate::ProbingDialog,
+    modal: Rc<crate::win_dialog::ModalState>,
+}
+
+impl ProbeJob {
+    fn new(path: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            started: Instant::now(),
+            percent: 0,
+            pending: PendingAction::None,
+            dialog: None,
+        }
+    }
+
+    /// 该不该弹框了。两种时候弹：等太久了，或者一级筛子判出可疑 VFR、
+    /// 正在拆包建帧表。
+    fn wants_dialog(&self) -> bool {
+        self.started.elapsed() >= PROBE_DIALOG_DELAY
+            || self.percent >= PROBE_TABLE_STAGE_PERCENT
+    }
+}
 
 /// 用户对「视频轨被 edit list 复制」的处理选择。
 /// 连输入路径一起存，换了文件就重新问一次。
@@ -64,8 +134,31 @@ pub struct AppController {
     mode_index: i32,
     /// 裁剪单位：0 = 按帧，1 = 按时间（与 Slint 侧单选框对应）
     trim_unit_index: i32,
-    /// 抽帧探测结果缓存（按帧裁剪时要拿帧率换算，日志里也要用）
-    last_probe: Option<crate::services::ffmpeg::MediaInfo>,
+    /// 裁剪输入框里那两段文本目前是按哪个单位填的（0 = 帧，1 = 时间）。
+    /// `None` = 没有欠账，文本和 `trim_unit_index` 一致。
+    ///
+    /// 光记一个 bool（"欠一次换算"）不够：`convert_trim_texts` 只能「从另一个单位
+    /// 换到当前单位」，单位来回切偶数次之后文本已经回到当前单位了，欠着的那次换算
+    /// 却还在，补算时方向就反了 —— 帧号会被当成时间戳，120 帧变 120 秒（3600 帧）。
+    /// 记下文本自己的单位，方向就不会错。
+    trim_text_unit: Option<i32>,
+    /// 探测结果缓存：同一个文件在这一次运行里只探一次（预览、切裁剪单位、
+    /// 点开始编码都要用）。只放内存，不落盘。
+    probe_cache: FrameCache,
+    /// 后台探测服务。探测要起子进程（约 270 ms 起），放在 UI 线程上会冻界面。
+    probe_service: ProbeService,
+    probe_rx: Receiver<ProbeEvent>,
+    /// 正在跑的探测；None = 没有
+    probe_job: Option<ProbeJob>,
+    /// 探过但打不开的文件。记下来免得每次问都重探一遍（重探会失败得一样快）。
+    probe_failed: Option<String>,
+    /// 上一次看到的输入文件（绝对路径）。识别"用户换文件了"用。
+    /// 换文件要把 `probe_failed` 清掉：探测超时只是一次性的，留着的会让这个文件
+    /// 在本次运行里永远按不了帧裁（每次都报「帧率未知」）。
+    last_input_seen: String,
+    /// 当前输入文件的探测结果，是 `probe_cache` 里那一份的快捷引用。
+    /// 还没探到、或者文件探测失败时为 None。
+    last_probe: Option<std::sync::Arc<Probe>>,
     /// 上次解析出的裁剪区间（秒），仅用于 [CONFIG] 日志
     last_trim: (Option<f64>, Option<f64>),
     /// 视频轨被 edit list 复制过时用户的选择（见 `RepeatDecision`）
@@ -86,9 +179,10 @@ pub struct AppController {
     preview_host: isize,
     /// 预览最近一次打开的输入文件，用来判断要不要重新 load
     preview_opened: Option<String>,
-    /// 当前预览文件的帧率。0 = 探不出来，此时帧号相关的控件禁用。
-    /// 和按帧裁剪用的是同一次 ffprobe 结果，两边帧号必须一致。
-    preview_fps: f64,
+    /// 当前预览文件的帧号换算方式。恒定帧率线性算，可变帧率查表。
+    /// `Framing::Unknown` = 探不出来，此时帧号相关的控件禁用。
+    /// 和按帧裁剪用的是同一次探测结果，两边帧号必须一致。
+    preview_framing: Framing,
     /// 正在把换算结果写回另一个输入框。程序写 text 理论上不会触发 edited，
     /// 但两个框互相写，一旦触发就是死循环，加个闸保险。
     preview_syncing: bool,
@@ -105,6 +199,7 @@ impl AppController {
     pub fn create() -> Rc<RefCell<Self>> {
         let ui = crate::MainWindow::new().expect("failed to create main window");
         let (service, rx) = FfmpegService::new();
+        let (probe_service, probe_rx) = ProbeService::new();
 
         // 读取持久化设置：首次运行（无设置文件）回落默认值（中文）
         let settings = settings::load();
@@ -123,6 +218,13 @@ impl AppController {
             current_log_path: None,
             mode_index: 0,
             trim_unit_index: 0,
+            trim_text_unit: None,
+            probe_cache: FrameCache::default(),
+            probe_service,
+            probe_rx,
+            probe_job: None,
+            probe_failed: None,
+            last_input_seen: String::new(),
             last_probe: None,
             last_trim: (None, None),
             repeat_decision: None,
@@ -134,7 +236,7 @@ impl AppController {
             preview: None,
             preview_host: 0,
             preview_opened: None,
-            preview_fps: 0.0,
+            preview_framing: Framing::Unknown,
             preview_syncing: false,
         }));
         // 弱引用要等 Rc 建好才能取，所以放在构造之后补上
@@ -175,13 +277,23 @@ impl AppController {
         let w = weak.clone();
         ui.on_start_encode(move || {
             if let Some(c) = w.upgrade() {
-                c.borrow_mut().handle_start_encode();
+                let mut c = c.borrow_mut();
+                c.forget_probe_failure();
+                c.handle_start_encode();
             }
         });
         let w = weak.clone();
         ui.on_stop_encode(move || {
             if let Some(c) = w.upgrade() {
                 c.borrow_mut().handle_stop_encode();
+            }
+        });
+        let w = weak.clone();
+        ui.on_extract_audio(move || {
+            if let Some(c) = w.upgrade() {
+                let mut c = c.borrow_mut();
+                c.forget_probe_failure();
+                c.handle_extract_audio();
             }
         });
         let w = weak.clone();
@@ -256,7 +368,7 @@ impl AppController {
             if let Some(c) = w.upgrade() {
                 let c = c.borrow();
                 if let Some(p) = &c.preview {
-                    p.set_paused(!p.state().paused);
+                    p.toggle_paused();
                 }
             }
         });
@@ -277,6 +389,39 @@ impl AppController {
                     if dur > 0.0 {
                         p.seek((ratio as f64 * dur).clamp(0.0, dur));
                     }
+                }
+            }
+        });
+        let w = weak.clone();
+        ui.on_preview_seek_by(move |secs: f32| {
+            if let Some(c) = w.upgrade() {
+                if let Some(p) = &c.borrow().preview {
+                    p.seek_by(secs as f64);
+                }
+            }
+        });
+        let w = weak.clone();
+        ui.on_preview_set_volume(move |volume: f32| {
+            if let Some(c) = w.upgrade() {
+                if let Some(p) = &c.borrow().preview {
+                    p.set_volume(volume as f64);
+                }
+            }
+        });
+        let w = weak.clone();
+        ui.on_preview_volume_step(move |delta: f32| {
+            if let Some(c) = w.upgrade() {
+                if let Some(p) = &c.borrow().preview {
+                    p.step_volume(delta as f64);
+                }
+            }
+        });
+        let w = weak.clone();
+        ui.on_preview_toggle_mute(move || {
+            if let Some(c) = w.upgrade() {
+                let c = c.borrow();
+                if let Some(p) = &c.preview {
+                    p.toggle_mute();
                 }
             }
         });
@@ -347,6 +492,7 @@ impl AppController {
             if let Some(c) = w.upgrade() {
                 let mut c = c.borrow_mut();
                 c.drain_events();
+                c.drain_probe_events();
                 apply_window_size(&c.ui);
                 c.sync_preview();
             }
@@ -393,25 +539,24 @@ impl AppController {
         }
     }
 
-    fn handle_start_encode(&mut self) {
+    /// 输入的公共校验（顺序与文案照搬旧程序 `Start_Click`）。
+    /// 过了返回规范化后的绝对路径，没过就弹提示并返回 None。
+    fn validated_input_path(&mut self) -> Option<String> {
         let input_text = self.ui.get_input_path().to_string();
-        let output_text = self.ui.get_output_path().to_string();
-
-        // ---- 校验（顺序与文案照搬旧程序 Start_Click） ----
         let input_path = input_text.trim().to_string();
         if input_path.is_empty() {
             self.show_warning(
                 self.strings.title_validation.clone(),
                 self.strings.msg_empty_input.clone(),
             );
-            return;
+            return None;
         }
         if !validate_path(&input_path) {
             self.show_warning(
                 self.strings.title_validation.clone(),
                 self.strings.msg_invalid_input.clone(),
             );
-            return;
+            return None;
         }
         let full = full_path(&input_path).unwrap_or_default();
         if !Path::new(&full).exists() {
@@ -419,15 +564,48 @@ impl AppController {
                 self.strings.title_error.clone(),
                 self.strings.msg_input_not_found.clone(),
             );
+            return None;
+        }
+        Some(full.to_string_lossy().into_owned())
+    }
+
+    /// 探测还没好：记下用户点的是哪个操作，结果到了由 `resume_pending_action` 接着走。
+    fn defer_until_probed(&mut self, path: &str, action: PendingAction) {
+        if let Some(j) = &mut self.probe_job {
+            if j.path == path {
+                j.pending = action;
+            }
+        }
+    }
+
+    fn handle_start_encode(&mut self) {
+        let output_text = self.ui.get_output_path().to_string();
+
+        // ---- 校验（顺序与文案照搬旧程序 Start_Click） ----
+        let Some(full_str) = self.validated_input_path() else {
+            return;
+        };
+        let input_text = full_str.clone();
+
+        // 探测要起子进程（约 270 ms 起），不能在 UI 线程上干等。没有结果就先请一次，
+        // 结果到了 `drain_probe_events` 会把这个方法原样重跑一遍 ——
+        // 和 `show_repeat_dialog` 那套重入是一个路子。
+        // edit list 那种「编一遍还是两遍」要等探测出来才知道，所以放在探测之后。
+        if let ProbeLookup::Pending = self.lookup_probe(&full_str) {
+            self.defer_until_probed(&full_str, PendingAction::StartEncode);
             return;
         }
 
         // ---- 视频轨被 edit list 复制过？（"战渣浪"那类为躲二压做出来的文件） ----
         // 这类文件的容器只声明一遍时长，ffmpeg 却按 edit list 编两遍。进度条用的总时长
-        // 取自声明值，跑到一半就到 100%，看起来像是一直不结束。这里先问用户要编几遍，
+        // 取自声明值，跑到一半就到 100%，看着像是不结束。这里先问用户要编几遍，
         // 同一个文件问过一次就不再问。
-        let full_str = full.to_string_lossy().into_owned();
-        let repeated = crate::services::ffmpeg::probe_repeated_timeline(&full_str);
+        // edit list 只可能出现在 mp4/mov 上，数包那一趟由 `probe_repeated_timeline`
+        // 内部用 `ftyp` 挡掉别的容器。
+        let probe = self.last_probe.clone();
+        let repeated = probe
+            .as_ref()
+            .and_then(|p| crate::services::ffmpeg::probe_repeated_timeline(&full_str, p));
         let decided = self
             .repeat_decision
             .as_ref()
@@ -455,7 +633,7 @@ impl AppController {
         });
 
         // ---- 裁剪区间（勾选且填了起止才生效；按帧要先探源帧率） ----
-        let (trim_start_secs, trim_end_secs) = match self.resolve_trim(&full, timeline_secs) {
+        let (trim_start_secs, trim_end_secs) = match self.resolve_trim(timeline_secs) {
             Ok(v) => v,
             Err(msg) => {
                 let title = self.strings.title_validation.clone();
@@ -464,7 +642,7 @@ impl AppController {
             }
         };
 
-        // 覆盖 ffprobe 读到的总时长：视频轨被 edit list 复制时，容器声明的只是
+        // 覆盖探测到的总时长：视频轨被 edit list 复制时，容器声明的只是
         // 其中一遍，展开后的时间轴才是真实长度。裁剪掉的那一段不在这里减 ——
         // run_encoding 会按 plan 里的 trim 区间统一折算，减两次会把分母算错。
         let duration_override = timeline_secs;
@@ -478,7 +656,6 @@ impl AppController {
             width_text: self.ui.get_width_text().to_string(),
             height_text: self.ui.get_height_text().to_string(),
             scale_up: self.ui.get_scale_up(),
-            extract_audio: self.ui.get_extract_audio(),
             audio_mode_index: self.ui.get_audio_mode_index(),
             audio_codec_index: self.ui.get_audio_codec_index(),
             trim_start_secs,
@@ -507,19 +684,91 @@ impl AppController {
             }
             Err(e) => {
                 self.set_encoding(false);
-                // 参数不合法算用户填错了，其余当启动失败。冒号后面是底层原文，不翻译。
-                match &e {
-                    AppError::InvalidArgument(detail) => {
-                        let msg = self.strings.msg_invalid_parameter.replace("{detail}", detail);
-                        let title = self.strings.title_validation.clone();
-                        self.show_warning(title, msg);
-                    }
-                    _ => {
-                        let msg = self.strings.msg_encode_failed.replace("{detail}", &e.to_string());
-                        let title = self.strings.title_error.clone();
-                        self.show_error(title, msg);
-                    }
-                }
+                self.show_build_error(&e);
+            }
+        }
+    }
+
+    /// 「提取音轨」按钮：把音频流原样复制出来，不重编码、不编视频。跑完不弹文件夹，
+    /// 要用结果行里的「打开输出文件夹」自己点过去（`last_output_path` 已经指到产物上）。
+    fn handle_extract_audio(&mut self) {
+        let output_text = self.ui.get_output_path().to_string();
+
+        let Some(full_str) = self.validated_input_path() else {
+            return;
+        };
+
+        // 提取要用的两个信息都在探测结果里：源音频编码决定导出文件的扩展名，按帧裁剪
+        // 要用帧率。所以和「开始」一样，探测没好就先等它。
+        if let ProbeLookup::Pending = self.lookup_probe(&full_str) {
+            self.defer_until_probed(&full_str, PendingAction::ExtractAudio);
+            return;
+        }
+
+        // 探测成功但这个文件根本没音轨：直说，别等 ffmpeg 报 "does not contain any
+        // stream" 那种看不懂的话。探测没成功（`last_probe` 为 None）时不拦，
+        // 交给 ffmpeg 去报。
+        if self.last_probe.as_ref().is_some_and(|p| p.audio_codec.is_none()) {
+            let title = self.strings.title_validation.clone();
+            let msg = self.strings.msg_no_audio_track.clone();
+            self.show_warning(title, msg);
+            return;
+        }
+
+        // 勾了「裁剪视频」就跟着裁，导出的音频和裁过的视频是同一段。
+        // 传 None：edit list 展开那套只影响视频轨，音轨没有 edit list。
+        let (trim_start_secs, trim_end_secs) = match self.resolve_trim(None) {
+            Ok(v) => v,
+            Err(msg) => {
+                let title = self.strings.title_validation.clone();
+                self.show_warning(title, msg);
+                return;
+            }
+        };
+
+        let input = AudioExtractInput {
+            input_text: full_str,
+            output_text,
+            trim_start_secs,
+            trim_end_secs,
+            source_audio_codec: self.last_probe.as_ref().and_then(|p| p.audio_codec.clone()),
+        };
+
+        self.set_encoding(true);
+
+        match build_audio_extract(input) {
+            Ok(plan) => {
+                self.last_output_path = Some(plan.output.clone());
+                self.current_log_path = plan.log_file_path.clone();
+
+                self.ui.set_progress_visible(true);
+                self.ui.set_result_visible(false);
+                self.ui.set_progress_value(0.0);
+
+                self.reset_log();
+                self.log_extract_config_lines();
+                self.service.start(plan);
+            }
+            Err(e) => {
+                self.set_encoding(false);
+                self.show_build_error(&e);
+            }
+        }
+    }
+
+    /// 方案构建失败时的提示。参数不合法算用户填错了，其余当启动失败。
+    /// 冒号后面是底层原文，不翻译。
+    fn show_build_error(&mut self, e: &AppError) {
+        match e {
+            AppError::InvalidArgument(detail) => {
+                let msg = self.strings.msg_invalid_parameter.replace("{detail}", detail);
+                let title = self.strings.title_validation.clone();
+                self.show_warning(title, msg);
+            }
+            _ => {
+                let msg = self.strings.msg_encode_failed.replace("{detail}", &e.to_string());
+                let title = self.strings.title_error.clone();
+                self.show_error(title, msg);
             }
         }
     }
@@ -528,13 +777,10 @@ impl AppController {
     /// 按帧输入时用源视频帧率换算（第 0 帧 = 源第一帧）；超出总时长会 clamp。
     ///
     /// `duration_override` 是「编两遍」时 edit list 展开后的长度，用它当 clamp 的上限；
-    /// 传 None 就按 ffprobe 报的容器声明时长算。
-    fn resolve_trim(
-        &mut self,
-        input_full: &Path,
-        duration_override: Option<f64>,
-    ) -> Result<(Option<f64>, Option<f64>), String> {
-        self.last_probe = None;
+    /// 传 None 就按探测器报的容器声明时长算。
+    /// 探测结果由调用方（`handle_start_encode`）保证就绪——它在本方法之前
+    /// 已经用 `lookup_probe` 确认过，没就绪就先返回了。
+    fn resolve_trim(&mut self, duration_override: Option<f64>) -> Result<(Option<f64>, Option<f64>), String> {
         self.last_trim = (None, None);
         if !self.ui.get_trim_enabled() {
             return Ok((None, None));
@@ -548,17 +794,19 @@ impl AppController {
         }
 
         let by_frame = self.trim_unit_index == 0;
-        let probe = crate::services::ffmpeg::probe_media(&input_full.to_string_lossy());
-        if let Some(p) = &probe {
-            self.last_probe = Some(p.clone());
-        }
-        let fps = probe.as_ref().map(|p| p.fps).unwrap_or(0.0);
-        let nb_frames = probe.as_ref().map(|p| p.nb_frames).unwrap_or(0);
+        // 探测结果由 `handle_start_encode` 在调这里之前保证就绪（没就绪它会先返回）。
+        // `last_probe` 是当前文件的那一份。
+        let framing = self
+            .last_probe
+            .as_ref()
+            .map(|p| p.framing.clone())
+            .unwrap_or(Framing::Unknown);
+        let nb_frames = self.last_probe.as_ref().map(|p| p.nb_frames).unwrap_or(0);
         let duration = duration_override
-            .or_else(|| probe.as_ref().map(|p| p.duration))
+            .or_else(|| self.last_probe.as_ref().map(|p| p.duration))
             .unwrap_or(0.0);
 
-        if by_frame && fps <= 0.0 {
+        if by_frame && !framing.is_valid() {
             return Err(self.strings.msg_no_fps.clone());
         }
 
@@ -574,7 +822,10 @@ impl AppController {
                     return Err(bad_frame());
                 }
                 let frame = if nb_frames > 0 { frame.min(nb_frames) } else { frame };
-                crate::services::trim::frame_to_secs(frame, fps)
+                // 帧号超过 VFR 帧表长度时 `frame_to_secs` 查不到、返回 0，
+                // 裁剪区间会静默变成「从 0 开始」。夹到最后一帧：填一个越过末尾的
+                // 号，本意就是到视频末尾。
+                framing.frame_to_secs(framing.clamp_frame(frame))
             } else {
                 crate::services::trim::parse_timecode(text).ok_or_else(|| {
                     self.strings.msg_invalid_time.replace("{text}", text)
@@ -601,15 +852,10 @@ impl AppController {
         }
     }
 
+    /// 「打开输出文件夹」：打开并选中产物本身，不是只把文件夹打开。
     fn handle_open_folder(&mut self) {
         if let Some(out) = &self.last_output_path {
-            let dir = out
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if !dir.is_empty() {
-                let _ = crate::io::external::open_folder(&dir);
-            }
+            let _ = crate::io::external::open_folder_selecting(out);
         }
     }
 
@@ -702,25 +948,47 @@ impl AppController {
         if new_index == self.trim_unit_index {
             return;
         }
+        // 文本没被换算过，单位也就没变：已经欠着一次换算的话，文本的单位就是欠的那次
+        // 记下的单位；不欠的话，文本的单位就是切换前的当前单位。
+        // 不能直接取切换前的当前单位 —— 来回切两次之后文本其实回到了原单位，而那次
+        // 欠着的换算还没补，取错方向会把帧号当成时间戳（120 帧变 120 秒）。
+        self.trim_text_unit = Some(self.trim_text_unit.unwrap_or(self.trim_unit_index));
         self.trim_unit_index = new_index;
+        self.convert_trim_texts();
+    }
 
-        let start = self.ui.get_trim_start_text().to_string();
-        let end = self.ui.get_trim_end_text().to_string();
-        // 两个框都空着就没什么可换的，也别为它白跑一次 ffprobe
-        if start.trim().is_empty() && end.trim().is_empty() {
+    /// 按当前的裁剪单位把两个输入框的文本换算一遍。
+    ///
+    /// 换不了就**原样留着**（空串、格式不对、帧率还没探到），和按帧编码时会报
+    /// `msg_no_fps` 的口径一致。只在 `trim_text_unit` 记着"文本是另一个单位"时才
+    /// 真的换 —— 帧率没探到的时候那次换算没做成，标记留着，由 `apply_probe` 补。
+    fn convert_trim_texts(&mut self) {
+        let Some(from) = self.trim_text_unit else {
+            return;
+        };
+        // 单位又切回来了，文本本来就是当前单位，不用换
+        if from == self.trim_unit_index {
+            self.trim_text_unit = None;
             return;
         }
-        // 两边换算都要帧率（帧 → 秒），拿不到就原样留着，
-        // 和按帧编码时会报 msg_no_fps 的口径一致
-        let fps = match self.probe_fps_for_trim() {
-            Some(fps) => fps,
-            None => return,
-        };
+        let start = self.ui.get_trim_start_text().to_string();
+        let end = self.ui.get_trim_end_text().to_string();
+        // 两个框都空着就没什么可换的，也别为它白跑一次探测
+        if start.trim().is_empty() && end.trim().is_empty() {
+            self.trim_text_unit = None;
+            return;
+        }
+        let framing = self.current_framing();
+        if !framing.is_valid() {
+            // 帧率还没探到，留着等 apply_probe 再补
+            return;
+        }
         let to_frames = self.trim_unit_index == 0;
         self.ui
-            .set_trim_start_text(trim::convert_unit_text(&start, to_frames, fps).into());
+            .set_trim_start_text(trim::convert_unit_text(&start, to_frames, &framing).into());
         self.ui
-            .set_trim_end_text(trim::convert_unit_text(&end, to_frames, fps).into());
+            .set_trim_end_text(trim::convert_unit_text(&end, to_frames, &framing).into());
+        self.trim_text_unit = None;
     }
 
     // =============================================================
@@ -759,6 +1027,9 @@ impl AppController {
                     // 要用预览再点侧边的展开按钮。
                     c.ui.set_preview_expanded(false);
                     c.ui.set_preview_available(true);
+                    // 让预览快捷键一开始就是活的：Slint 只往有焦点的元素送按键，
+                    // 没元素有焦点时按键直接丢。
+                    c.ui.invoke_focus_preview_keys();
                     apply_window_size(&c.ui);
                     c.reload_preview_source();
                 }
@@ -777,6 +1048,11 @@ impl AppController {
     fn toggle_preview_expanded(&mut self) {
         let expanded = !self.ui.get_preview_expanded();
         self.ui.set_preview_expanded(expanded);
+        if expanded {
+            // 展开时把键盘焦点收到预览这一层：刚才可能在输入框里，不收的话
+            // 空格会被打成空格，快捷键一个都进不来。
+            self.ui.invoke_focus_preview_keys();
+        }
         apply_window_size(&self.ui);
         self.sync_preview();
     }
@@ -823,12 +1099,19 @@ impl AppController {
             .set_preview_time_text(trim::format_timecode(st.time_pos).into());
         self.ui
             .set_preview_duration_text(trim::format_timecode(st.duration).into());
-        // 帧号要和按帧裁剪用同一套算法，都用 trim 里那两个换算函数
-        if st.loaded && self.preview_fps > 0.0 {
-            self.ui
-                .set_preview_frame_cur(trim::secs_to_frame(st.time_pos, self.preview_fps).to_string().into());
+        // 帧号要和按帧裁剪用同一套算法，都走 Framing 上的换算
+        if st.loaded && self.preview_framing.is_valid() {
+            self.ui.set_preview_frame_cur(
+                self.preview_framing
+                    .secs_to_frame(st.time_pos)
+                    .to_string()
+                    .into(),
+            );
             self.ui.set_preview_frame_total(
-                trim::secs_to_frame(st.duration, self.preview_fps).to_string().into(),
+                self.preview_framing
+                    .secs_to_frame(st.duration)
+                    .to_string()
+                    .into(),
             );
         } else {
             self.ui.set_preview_frame_cur("--".into());
@@ -838,6 +1121,11 @@ impl AppController {
         if !self.ui.get_preview_scrubbing() {
             self.ui.set_preview_seek_1000((st.progress() * 1000.0) as f32);
         }
+        // 音量同理：拖动期间不回写，否则拖到一半会被上一轮的旧值拽回去
+        if !self.ui.get_preview_vol_dragging() {
+            self.ui.set_preview_volume(st.volume as f32);
+        }
+        self.ui.set_preview_muted(st.mute);
     }
 
     /// 输入文件变了就把新文件塞给 mpv。没变则什么都不做。
@@ -853,12 +1141,12 @@ impl AppController {
         p.set_paused(true);
         p.open(Path::new(&path));
         self.preview_opened = Some(path);
-        // 帧号换算要帧率。和按帧裁剪走同一条 ffprobe，别另起一套，
+        // 帧号换算要帧率。和按帧裁剪走同一次探测，别另起一套，
         // 否则「当前帧为开头」填进去的帧号和编码时算的对不上。
-        self.preview_fps = self.probe_fps_for_trim().unwrap_or(0.0);
-        self.ui.set_preview_fps_known(self.preview_fps > 0.0);
-        // 预览面板按真实宽高比摆画面。上一次探测的结果里带着宽高，不用再跑一遍 ffprobe；
-        // 探不到（比如 ffprobe 只给了部分字段）就按 16:9 摆。
+        self.preview_framing = self.current_framing();
+        self.ui.set_preview_fps_known(self.preview_framing.is_valid());
+        // 预览面板按真实宽高比摆画面。探测结果里带着宽高，不用再探一遍；
+        // 探不到（比如没有视频轨）就按 16:9 摆。
         let aspect = match &self.last_probe {
             Some(info) if info.width > 0 && info.height > 0 => {
                 info.width as f32 / info.height as f32
@@ -877,8 +1165,8 @@ impl AppController {
         self.ui
             .set_preview_time_input(trim::format_timecode(secs).into());
         self.ui.set_preview_frame_input(
-            if self.preview_fps > 0.0 {
-                trim::secs_to_frame(secs, self.preview_fps).to_string()
+            if self.preview_framing.is_valid() {
+                self.preview_framing.secs_to_frame(secs).to_string()
             } else {
                 "0".to_string()
             }
@@ -889,7 +1177,7 @@ impl AppController {
 
     /// 用户改了帧号框：把对应的时间戳算出来填进另一个框。
     fn preview_frame_edited(&mut self, text: &str) {
-        if self.preview_syncing || self.preview_fps <= 0.0 {
+        if self.preview_syncing || !self.preview_framing.is_valid() {
             return;
         }
         // 打字过程中会经过 "1"、"12" 这种半截状态，解析不了就什么都不做，
@@ -900,7 +1188,8 @@ impl AppController {
         if frame < 0 {
             return;
         }
-        let secs = trim::frame_to_secs(frame, self.preview_fps);
+        // 越界的帧号夹到最后一帧再换算，否则 VFR 上会查不到、时间框变成 0
+        let secs = self.preview_framing.frame_to_secs(self.preview_framing.clamp_frame(frame));
         self.preview_syncing = true;
         self.ui
             .set_preview_time_input(trim::format_timecode(secs).into());
@@ -915,10 +1204,10 @@ impl AppController {
         let Some(secs) = trim::parse_timecode(text) else {
             return;
         };
-        if self.preview_fps <= 0.0 {
+        if !self.preview_framing.is_valid() {
             return;
         }
-        let frame = trim::secs_to_frame(secs, self.preview_fps);
+        let frame = self.preview_framing.secs_to_frame(secs);
         self.preview_syncing = true;
         self.ui
             .set_preview_frame_input(frame.to_string().into());
@@ -930,13 +1219,14 @@ impl AppController {
         let Some(p) = &self.preview else { return };
         let time_text = self.ui.get_preview_time_input().to_string();
         let frame_text = self.ui.get_preview_frame_input().to_string();
+        let framing = self.preview_framing.clone();
         let secs = trim::parse_timecode(&time_text).or_else(|| {
             frame_text
                 .trim()
                 .parse::<i64>()
                 .ok()
-                .filter(|_| self.preview_fps > 0.0)
-                .map(|f| trim::frame_to_secs(f, self.preview_fps))
+                .filter(|_| framing.is_valid())
+                .map(|f| framing.frame_to_secs(framing.clamp_frame(f)))
         });
         let Some(secs) = secs else { return };
         let dur = p.state().duration;
@@ -951,7 +1241,7 @@ impl AppController {
         let target = if to_start {
             0.0
         } else {
-            (p.state().duration - 1.0 / self.preview_fps.max(1.0)).max(0.0)
+            (p.state().duration - 1.0 / self.preview_framing.fps_f64().max(1.0)).max(0.0)
         };
         p.set_paused(true);
         p.seek(target);
@@ -963,10 +1253,10 @@ impl AppController {
         let secs = p.state().time_pos;
         let text = if self.trim_unit_index == 0 {
             // 按帧：要帧率，拿不到就不动，免得填一个错的帧号进去
-            if self.preview_fps <= 0.0 {
+            if !self.preview_framing.is_valid() {
                 return;
             }
-            trim::secs_to_frame(secs, self.preview_fps).to_string()
+            self.preview_framing.secs_to_frame(secs).to_string()
         } else {
             trim::format_timecode(secs)
         };
@@ -980,18 +1270,223 @@ impl AppController {
         self.ui.set_preview_scrubbing(false);
     }
 
-    /// 取源视频帧率（按帧裁剪的换算要用）。探测结果沿用 `last_probe` 的缓存策略。
-    fn probe_fps_for_trim(&mut self) -> Option<f64> {
-        if let Some(info) = &self.last_probe {
-            if info.fps > 0.0 {
-                return Some(info.fps);
+    /// 取某个输入文件的探测结果。命中缓存就直接返回，否则现场探一次再存起来。
+    ///
+    /// 同一个文件在一次运行里会被问好几次（开预览、切裁剪单位、点开始编码），
+    /// 缓存就是挡这些重复的子进程的。文件打不开时返回 None，`last_probe` 一并清掉。
+    /// 当前输入框里的文件（绝对路径）。探测缓存的键统一用它，
+    /// 免得同一个文件因为写法不同（相对/绝对）出现两个条目、白探一次。
+    fn current_input_path(&self) -> String {
+        let raw = self.ui.get_input_path().to_string();
+        if raw.trim().is_empty() {
+            return String::new();
+        }
+        full_path(raw.trim())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// 用户又点了一次「开始」或「提取音轨」，把上一轮「这个文件探不动」的记号清掉。
+    ///
+    /// 超时那种失败（探测慢、杀毒扫描、冷启动）是一过性的：不清的话，只要输入框里
+    /// 一直是这个文件，`drain_probe_events` 里那条「换文件才清」的逻辑就永远不触发，
+    /// 这个文件在本次运行里再也不会被探测，按帧裁剪一直报「读不出帧率」。
+    ///
+    /// 只挂在按钮的回调上、不放进 `handle_start_encode` 里面：探测失败后
+    /// `resume_pending_action` 会把那个方法重跑一遍，清在这里会变成
+    /// 「重探 → 失败 → 重探」的死循环。
+    fn forget_probe_failure(&mut self) {
+        self.probe_failed = None;
+    }
+
+    /// 查某个文件的探测结果。没有就顺手请一次后台探测——**不在 UI 线程上等**，
+    /// 结果到了由 `drain_probe_events` 接手。
+    fn lookup_probe(&mut self, path: &str) -> ProbeLookup {
+        if path.is_empty() {
+            self.last_probe = None;
+            return ProbeLookup::Unavailable;
+        }
+        // 探过就知道打不开，别重探一遍（还会失败，只是白等）
+        if self.probe_failed.as_deref() == Some(path) {
+            self.last_probe = None;
+            return ProbeLookup::Unavailable;
+        }
+        if let Some(hit) = self.probe_cache.get(Path::new(path)) {
+            self.last_probe = Some(hit.clone());
+            return ProbeLookup::Ready(hit);
+        }
+
+        self.probe_service.request(path);
+        if !self.probe_job.as_ref().is_some_and(|j| j.path == path) {
+            self.probe_job = Some(ProbeJob::new(path));
+        }
+        ProbeLookup::Pending
+    }
+
+    /// 当前输入文件的帧号换算方式。还没探好就是 `Framing::Unknown`——
+    /// 探测完 `apply_probe` 会把结果补上。
+    fn current_framing(&mut self) -> Framing {
+        let path = self.current_input_path();
+        match self.lookup_probe(&path) {
+            ProbeLookup::Ready(p) => p.framing.clone(),
+            _ => Framing::Unknown,
+        }
+    }
+
+    /// 收后台探测的事件：更新进度、到点弹框、收结果。
+    fn drain_probe_events(&mut self) {
+        // 用户换文件了就把上一份「探测失败」清掉。超时那种失败是一过性的（探测慢、
+        // 冷启动、杀毒扫描），不清的话这个文件在本次运行里再也不会被探测，按帧裁剪
+        // 会一直报「帧率未知」。同一个文件一直选着则不清，免得对着坏文件反复重探。
+        let path = self.current_input_path();
+        if path != self.last_input_seen {
+            self.last_input_seen = path;
+            self.probe_failed = None;
+        }
+
+        while let Ok(event) = self.probe_rx.try_recv() {
+            match event {
+                ProbeEvent::Progress { path, percent } => {
+                    if let Some(j) = &mut self.probe_job {
+                        if j.path == path {
+                            j.percent = percent;
+                        }
+                    }
+                }
+                ProbeEvent::Done { path, probe } => {
+                    self.probe_service.finish(&path);
+                    self.probe_cache.insert(Path::new(&path), probe.clone());
+                    let is_current = self.current_input_path() == path;
+                    if is_current {
+                        self.last_probe = Some(probe.clone());
+                        self.apply_probe(&probe);
+                    }
+                    self.resume_pending_action(&path, is_current);
+                }
+                ProbeEvent::Failed { path } => {
+                    self.probe_service.finish(&path);
+                    self.probe_failed = Some(path.clone());
+                    if self.current_input_path() == path {
+                        self.last_probe = None;
+                    }
+                    // 探不了也要把等着的那个操作放行，让它走老路去报错
+                    self.resume_pending_action(&path, self.current_input_path() == path);
+                }
             }
         }
-        let path = self.ui.get_input_path().to_string();
-        let info = crate::services::ffmpeg::probe_media(&path)?;
-        let fps = info.fps;
-        self.last_probe = Some(info);
-        (fps > 0.0).then_some(fps)
+
+        // 超时兜底：卡住的 ffmpeg 不能把主窗口永久锁着
+        let timed_out = self
+            .probe_job
+            .as_ref()
+            .filter(|j| j.started.elapsed() >= PROBE_TIMEOUT)
+            .map(|j| j.path.clone());
+        if let Some(path) = timed_out {
+            self.probe_service.cancel();
+            self.probe_failed = Some(path.clone());
+            self.last_probe = None;
+            // 和 Done/Failed 一样要把等着的操作放行，否则用户点了按钮、等 20 秒、
+            // 进度框自己消失，然后什么也没发生
+            self.resume_pending_action(&path, self.current_input_path() == path);
+        }
+
+        self.update_probe_dialog();
+    }
+
+    /// 探测跑完了（成没成都算），把用户之前点下的那个操作接着走一遍。
+    fn resume_pending_action(&mut self, path: &str, is_current: bool) {
+        let pending = self.take_probe_job(path);
+        if !is_current {
+            return;
+        }
+        match pending {
+            PendingAction::StartEncode => self.handle_start_encode(),
+            PendingAction::ExtractAudio => self.handle_extract_audio(),
+            PendingAction::None => {}
+        }
+    }
+
+    /// 探测跑完了，收走这一格。返回等着要继续的那个操作。
+    fn take_probe_job(&mut self, path: &str) -> PendingAction {
+        let Some(job) = self.probe_job.as_ref() else {
+            return PendingAction::None;
+        };
+        if job.path != path {
+            return PendingAction::None;
+        }
+        let pending = job.pending;
+        // 放手会让 ModalState::drop 恢复主窗口；窗口也顺手藏掉
+        if let Some(d) = self.probe_job.take().and_then(|j| j.dialog) {
+            let _ = d.dialog.window().hide();
+            d.modal.dismiss();
+        }
+        pending
+    }
+
+    /// 按规则决定要不要弹进度框，以及框里的进度走到哪了。
+    fn update_probe_dialog(&mut self) {
+        // 编码途中不弹：这个框是 Blocking 模态，`open_blocking` 会把主窗口
+        // `EnableWindow(0)`，连「停止」一起点不动，用户只能干等探测结束。
+        // 编码中改输入框（打字、浏览、拖放）都会走到这儿，代价太大，宁可不显示进度。
+        if self.ui.get_encoding() {
+            return;
+        }
+        // 先算完再动，别让 `probe_job` 的可变借用跨过 `self.main_hwnd()`
+        let Some(needs_dialog) = self
+            .probe_job
+            .as_ref()
+            .map(|j| j.dialog.is_none() && j.wants_dialog())
+        else {
+            return;
+        };
+
+        if needs_dialog {
+            let dialog = crate::ProbingDialog::new().expect("failed to create probing dialog");
+            dialog.set_dialog_title(self.strings.probing_title.clone().into());
+            dialog.set_message(self.strings.probing_message.clone().into());
+            dialog.set_progress(0.0);
+            // 用户关不掉：探测亚秒级就结束，给「取消」要引入「编码流程被打断」
+            // 的状态机，不值当
+            let hwnd = self.main_hwnd();
+            let modal = crate::win_dialog::open_blocking(
+                &dialog,
+                hwnd,
+                (dialog.get_dialog_w(), dialog.get_dialog_h()),
+            );
+            if let Some(job) = &mut self.probe_job {
+                job.dialog = Some(ProbeDialog { dialog, modal });
+            }
+        }
+
+        if let Some(job) = &self.probe_job {
+            if let Some(d) = &job.dialog {
+                d.dialog
+                    .set_progress((job.percent as f32 / 100.0).clamp(0.0, 1.0));
+            }
+        }
+    }
+
+    /// 探测结果到了之后，把它用到等它的地方：预览的帧号换算与画面比例、
+    /// 裁剪输入框的单位换算。
+    fn apply_probe(&mut self, probe: &Probe) {
+        self.preview_framing = probe.framing.clone();
+        self.ui.set_preview_fps_known(probe.framing.is_valid());
+
+        if self.preview_opened.is_some() {
+            let aspect = if probe.width > 0 && probe.height > 0 {
+                probe.width as f32 / probe.height as f32
+            } else {
+                16.0 / 9.0
+            };
+            self.ui.set_video_aspect(aspect);
+        }
+
+        // 探测期间切过裁剪单位的话，那次换算被打回去了，这里补一次。
+        // 只在真的欠着一次换算的时候调：`convert_trim_texts` 是「从另一个单位换到
+        // 当前单位」，无条件调会把用户手填的帧号当成时间戳再换一遍。
+        if self.trim_text_unit.is_some() && self.ui.get_trim_enabled() {
+            self.convert_trim_texts();
+        }
     }
 
     fn handle_mode_changed(&mut self, text: String) {
@@ -1093,6 +1588,8 @@ impl AppController {
             self.last_output_bytes = Some(bytes);
             self.ui.set_output_size_text(self.result_size_text(bytes));
         }
+        // 跑完不自己弹文件夹。结果行里的「打开输出文件夹」已经能定位到这个文件
+        // （last_output_path 上面刚更新过），要不要跳过去让用户自己点。
     }
 
     /// 结果行里的「输出大小」文案，按当前语言拼。
@@ -1164,11 +1661,8 @@ impl AppController {
         let height = self.ui.get_height_text().trim().parse::<i32>().unwrap_or(0);
         let is_two_pass = self.mode_index == 1;
         let bitrate = if is_two_pass && value_box > 0 { value_box } else { 800 };
-        let crf = if !is_two_pass && (0..=51).contains(&value_box) {
-            value_box
-        } else {
-            23
-        };
+        // 和 build() 走同一条解析规则，免得日志里记的 CRF 跟实际传给 ffmpeg 的不一样
+        let crf = crf_from_text(&self.ui.get_value_text());
 
         let fmt_name = OutputFormat::from_index(self.ui.get_format_index())
             .extension()
@@ -1193,10 +1687,6 @@ impl AppController {
         self.append_log("[CONFIG] FPS: 24");
         self.append_log("[CONFIG] Preset: veryslow");
         self.append_log("[CONFIG] Profile: high, Level: 5.2");
-        self.append_log(&format!(
-            "[CONFIG] Audio extraction: {}",
-            if self.ui.get_extract_audio() { "enabled" } else { "disabled" }
-        ));
 
         // 音频模式：0 = 无音频，1 = 复制音频流，2 = 转码（编码器按容器兜底，与 args.rs 一致）
         let audio_mode = self.ui.get_audio_mode_index();
@@ -1213,7 +1703,24 @@ impl AppController {
         };
         self.append_log(&format!("[CONFIG] Audio mode: {audio_desc}"));
 
-        // 裁剪范围：显示解析后的秒数；按帧输入时附带源帧率
+        self.log_trim_line();
+
+        // 视频轨被 edit list 复制过时，记下这次是按哪一种编的
+        if let Some(note) = self.last_editlist_note.clone() {
+            self.append_log(&note);
+        }
+    }
+
+    /// 提取音轨那次运行的 [CONFIG] 记录。视频那些参数（CRF、分辨率、格式…）
+    /// 跟这一步没关系，不记。
+    fn log_extract_config_lines(&mut self) {
+        self.append_log("[CONFIG] Audio extraction only");
+        self.log_trim_line();
+    }
+
+    /// 裁剪范围那一行。编码和提取音轨两边都调它，记法一样。
+    fn log_trim_line(&mut self) {
+        // 显示解析后的秒数；按帧输入时附带源帧率
         match self.last_trim {
             (None, None) => self.append_log("[CONFIG] Trim: none"),
             (start, end) => {
@@ -1222,7 +1729,9 @@ impl AppController {
                     None => "start".to_string(),
                 };
                 let fps_note = match &self.last_probe {
-                    Some(p) if p.fps > 0.0 => format!(" @ {:.3} fps", p.fps),
+                    Some(p) if p.framing.is_valid() => {
+                        format!(" @ {:.3} fps", p.framing.fps_f64())
+                    }
                     _ => String::new(),
                 };
                 self.append_log(&format!(
@@ -1231,11 +1740,6 @@ impl AppController {
                     fmt(end)
                 ));
             }
-        }
-
-        // 视频轨被 edit list 复制过时，记下这次是按哪一种编的
-        if let Some(note) = self.last_editlist_note.clone() {
-            self.append_log(&note);
         }
     }
 

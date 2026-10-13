@@ -69,10 +69,41 @@ impl Drop for ModalState {
 /// 读出来传进来 —— 必须是这两个，不能用 `Window::size()`：那是窗口建好之后才有值的。
 ///
 /// 窗口由本函数负责显示。返回的 `ModalState` 要移进按钮回调，关闭时调一次 `dismiss()`。
+/// 用户能不能自己把对话框关掉。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClosePolicy {
+    /// 标题栏 X、Alt+F4 都当关闭（三个普通对话框用）
+    Dismissible,
+    /// 挡下 X 和 Alt+F4，只能由程序调 `dismiss()` 关（进度框用）
+    Blocking,
+}
+
 pub fn open<C: ComponentHandle + 'static>(
     comp: &C,
     owner: HWND,
     logical_size: (f32, f32),
+) -> Rc<ModalState> {
+    open_with(comp, owner, logical_size, ClosePolicy::Dismissible)
+}
+
+/// 和 [`open`] 一样，但**用户关不掉**：标题栏的 X 和 Alt+F4 都被挡下，只能由程序
+/// 在活干完之后调 [`ModalState::dismiss`]。
+///
+/// 「正在探测」那个进度框用它 —— 探测亚秒级就结束，给用户一个中途关掉的机会
+/// 反而要引入"编码流程被打断"的状态机，不值当。
+pub fn open_blocking<C: ComponentHandle + 'static>(
+    comp: &C,
+    owner: HWND,
+    logical_size: (f32, f32),
+) -> Rc<ModalState> {
+    open_with(comp, owner, logical_size, ClosePolicy::Blocking)
+}
+
+fn open_with<C: ComponentHandle + 'static>(
+    comp: &C,
+    owner: HWND,
+    logical_size: (f32, f32),
+    close_policy: ClosePolicy,
 ) -> Rc<ModalState> {
     // 位置要在窗口创建**之前**写进去，否则窗口会先在默认位置（左上角）露一下脸
     place_before_show(comp, owner, logical_size);
@@ -122,9 +153,13 @@ pub fn open<C: ComponentHandle + 'static>(
 
     // 点标题栏的 X、Alt+F4 都从这里过。少了这一步，主窗口会一直禁用着。
     let closed = state.clone();
-    comp.window().on_close_requested(move || {
-        closed.dismiss();
-        CloseRequestResponse::HideWindow
+    comp.window().on_close_requested(move || match close_policy {
+        ClosePolicy::Dismissible => {
+            closed.dismiss();
+            CloseRequestResponse::HideWindow
+        }
+        // 进度框不给关：窗口留着，主窗口也继续禁用着
+        ClosePolicy::Blocking => CloseRequestResponse::KeepWindowShown,
     });
 
     state

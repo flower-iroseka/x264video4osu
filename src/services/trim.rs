@@ -1,4 +1,9 @@
 //! 裁剪区间解析与换算。纯函数，便于单测。
+//!
+//! 帧号 ↔ 时间的**数学**在 [`crate::services::probe::Framing`] 上（恒定帧率线性算、
+//! 可变帧率查表），这里只管输入框里的文本怎么解析、怎么格式化。
+
+use crate::services::probe::Framing;
 
 /// 把 `时:分:秒.毫秒`（也接受 `分:秒` 和纯秒）解析成秒。空串/非法/负数返回 None。
 pub fn parse_timecode(s: &str) -> Option<f64> {
@@ -40,38 +45,13 @@ pub fn parse_timecode(s: &str) -> Option<f64> {
     Some(seconds)
 }
 
-/// 源帧号换算成秒（第 0 帧 = 源视频第一帧）。fps <= 0 时返回 0，调用方需先校验。
-pub fn frame_to_secs(frame: i64, fps: f64) -> f64 {
-    if fps <= 0.0 {
-        return 0.0;
-    }
-    frame as f64 / fps
-}
-
-/// 秒换算成源帧号，是 [`frame_to_secs`] 的反方向。预览位置回填到帧号输入框要用它。
-///
-/// 取的是**当前正在显示的那一帧**：预览停在 3.4567s、fps = 30 时返回 103
-/// （帧 103 占 [3.4333, 3.4667)），而不是「离得最近的那一帧」。
-/// 「把当前预览位置设为起点」要的是屏幕上那一帧，四舍五入会让它往后偏一帧。
-///
-/// 末尾那个 1e-6 是防浮点误差：`3.4333… × 30` 有可能算出 102.99999999999999，
-/// 直接 floor 会得到 102。
-///
-/// fps <= 0、秒数为负或非有限时返回 0，和 `frame_to_secs` 一样把校验留给调用方。
-pub fn secs_to_frame(secs: f64, fps: f64) -> i64 {
-    if fps <= 0.0 || !secs.is_finite() || secs < 0.0 {
-        return 0;
-    }
-    ((secs * fps) + 1e-6).floor() as i64
-}
-
 /// 把裁剪输入框里的值换到另一个单位。`to_frames` 为真表示时间 → 帧号，
 /// 为假表示帧号 → 时间。
 ///
 /// 换不了就**原样返回**：空串、格式不对、帧率拿不到（按帧那一侧要用它换算）都算换不了。
 /// 用户切一下单位，填错的那半截输入不该被抹掉。
-pub fn convert_unit_text(text: &str, to_frames: bool, fps: f64) -> String {
-    if fps <= 0.0 {
+pub fn convert_unit_text(text: &str, to_frames: bool, timing: &Framing) -> String {
+    if !timing.is_valid() {
         return text.to_string();
     }
     let converted = if to_frames {
@@ -79,14 +59,18 @@ pub fn convert_unit_text(text: &str, to_frames: bool, fps: f64) -> String {
         // 30fps 下第 1 帧是 33.33ms，存成 00:00:00.033 之后乘回去只有 0.99 帧，
         // floor 会掉到第 0 帧。补上半个毫秒正好抵消这次取整，来回切换不会掉帧。
         // （半个毫秒乘以再高的帧率也不到一帧，不会冲到下一帧去。）
-        parse_timecode(text).map(|secs| secs_to_frame(secs + 0.0005, fps).to_string())
+        parse_timecode(text).map(|secs| timing.secs_to_frame(secs + 0.0005).to_string())
     } else {
-        // 负数帧号按帧编码时本来就会被拒，这里也不接受
+        // 负数帧号按帧编码时本来就会被拒，这里也不接受。
+        // 越界的帧号先夹进范围再换算。按帧编码时 `resolve_trim` 夹的就是它，时间框
+        // 应该显示真正会生效的那个位置。不夹就会把这个纯数字原样留在时间框里，
+        // 而它在那边是**秒**（`parse_timecode` 把裸数字当秒），VFR 文件上切一次
+        // 单位，800 帧就变成了 800 秒。
         text.trim()
             .parse::<i64>()
             .ok()
             .filter(|f| *f >= 0)
-            .map(|frame| format_timecode(frame_to_secs(frame, fps)))
+            .map(|frame| format_timecode(timing.frame_to_secs(timing.clamp_frame(frame))))
     };
     converted.unwrap_or_else(|| text.to_string())
 }
@@ -105,6 +89,11 @@ pub fn format_timecode(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::probe::{FrameTable, Rational};
+
+    fn cfr(num: u32, den: u32) -> Framing {
+        Framing::Cfr(Rational::new(num, den))
+    }
 
     #[test]
     fn timecode_full() {
@@ -134,34 +123,6 @@ mod tests {
     }
 
     #[test]
-    fn frame_conversion() {
-        assert!((frame_to_secs(240, 24.0) - 10.0).abs() < 1e-9);
-        assert!((frame_to_secs(24, 23.976) - 1.001001).abs() < 1e-5);
-        assert_eq!(frame_to_secs(10, 0.0), 0.0);
-    }
-
-    #[test]
-    fn secs_to_frame_takes_the_displayed_frame() {
-        // 帧 103 占 [3.4333, 3.4667)，3.4567 落在这区间里
-        assert_eq!(secs_to_frame(3.4567, 30.0), 103);
-        // 帧边界上不能因为浮点误差退回上一帧
-        assert_eq!(secs_to_frame(103.0 / 30.0, 30.0), 103);
-        assert_eq!(secs_to_frame(240.0 / 24.0, 24.0), 240);
-        // 往回换算一轮应当回到原值
-        for f in [0_i64, 1, 29, 240, 1000] {
-            assert_eq!(secs_to_frame(frame_to_secs(f, 30.0), 30.0), f);
-        }
-    }
-
-    #[test]
-    fn secs_to_frame_guards_bad_input() {
-        assert_eq!(secs_to_frame(1.0, 0.0), 0);
-        assert_eq!(secs_to_frame(-3.0, 30.0), 0);
-        assert_eq!(secs_to_frame(f64::NAN, 30.0), 0);
-        assert_eq!(secs_to_frame(f64::INFINITY, 30.0), 0);
-    }
-
-    #[test]
     fn timecode_format() {
         assert_eq!(format_timecode(3723.5), "01:02:03.500");
         assert_eq!(format_timecode(0.0), "00:00:00.000");
@@ -171,32 +132,55 @@ mod tests {
     #[test]
     fn unit_conversion_both_ways() {
         // 帧 → 时间
-        assert_eq!(convert_unit_text("240", false, 24.0), "00:00:10.000");
-        assert_eq!(convert_unit_text(" 0 ", false, 30.0), "00:00:00.000");
+        assert_eq!(convert_unit_text("240", false, &cfr(24, 1)), "00:00:10.000");
+        assert_eq!(convert_unit_text(" 0 ", false, &cfr(30, 1)), "00:00:00.000");
         // 时间 → 帧
-        assert_eq!(convert_unit_text("00:00:10.000", true, 24.0), "240");
-        assert_eq!(convert_unit_text("10", true, 24.0), "240");
+        assert_eq!(convert_unit_text("00:00:10.000", true, &cfr(24, 1)), "240");
+        assert_eq!(convert_unit_text("10", true, &cfr(24, 1)), "240");
         // 来回换一轮回到原值
         for f in [0_i64, 1, 90, 240, 1000] {
-            let time = convert_unit_text(&f.to_string(), false, 30.0);
-            assert_eq!(convert_unit_text(&time, true, 30.0), f.to_string());
+            let time = convert_unit_text(&f.to_string(), false, &cfr(30, 1));
+            assert_eq!(convert_unit_text(&time, true, &cfr(30, 1)), f.to_string());
         }
     }
 
     #[test]
     fn unit_conversion_keeps_text_it_cannot_convert() {
         // 帧率拿不到，两边都没法换
-        assert_eq!(convert_unit_text("240", false, 0.0), "240");
-        assert_eq!(convert_unit_text("00:00:10.000", true, 0.0), "00:00:10.000");
+        let unknown = Framing::Unknown;
+        assert_eq!(convert_unit_text("240", false, &unknown), "240");
+        assert_eq!(
+            convert_unit_text("00:00:10.000", true, &unknown),
+            "00:00:10.000"
+        );
 
         // 空串和写错的值原样留着，不能抹成 0
-        assert_eq!(convert_unit_text("", true, 30.0), "");
-        assert_eq!(convert_unit_text("", false, 30.0), "");
-        assert_eq!(convert_unit_text("abc", true, 30.0), "abc");
-        assert_eq!(convert_unit_text("abc", false, 30.0), "abc");
-        assert_eq!(convert_unit_text("1:99:00", true, 30.0), "1:99:00");
+        assert_eq!(convert_unit_text("", true, &cfr(30, 1)), "");
+        assert_eq!(convert_unit_text("", false, &cfr(30, 1)), "");
+        assert_eq!(convert_unit_text("abc", true, &cfr(30, 1)), "abc");
+        assert_eq!(convert_unit_text("abc", false, &cfr(30, 1)), "abc");
+        assert_eq!(convert_unit_text("1:99:00", true, &cfr(30, 1)), "1:99:00");
 
         // 负数帧号按帧编码时会被拒，换算时也不认
-        assert_eq!(convert_unit_text("-5", false, 30.0), "-5");
+        assert_eq!(convert_unit_text("-5", false, &cfr(30, 1)), "-5");
+    }
+
+    #[test]
+    fn unit_conversion_goes_through_the_table_for_vfr() {
+        // 三种帧间隔的 VFR：帧 5 在第 7168 刻度（= 0.4667s），不是线性换算的 0.1667s
+        let vfr = Framing::Vfr {
+            fps: Rational::new(30, 1),
+            table: FrameTable {
+                timebase: Rational::new(1, 15360),
+                pts: vec![0, 512, 1024, 1536, 2048, 7168],
+            },
+        };
+        assert_eq!(convert_unit_text("5", false, &vfr), "00:00:00.467");
+        assert_eq!(convert_unit_text("00:00:00.467", true, &vfr), "5");
+
+        // 越界的帧号先夹到最后一帧（第 5 帧）再换算，时间框显示的就是它的时间。
+        // 以前是原样留着，那串数字在时间框里会被当成"秒"读。
+        assert_eq!(convert_unit_text("6", false, &vfr), "00:00:00.467");
+        assert_eq!(convert_unit_text("9999", false, &vfr), "00:00:00.467");
     }
 }

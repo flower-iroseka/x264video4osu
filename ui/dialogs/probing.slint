@@ -1,0 +1,66 @@
+import { VerticalBox } from "std-widgets.slint";
+import { DialogWindow } from "dialog-base.slint";
+
+// 「正在探测」进度框。
+//
+// 只在两种情况下弹：探测超过 400 ms 还没结束，或者判定出这是个可变帧率文件、
+// 要去拆一遍包。典型的 osu! 背景视频探测只要一两百毫秒，用户根本看不到这个框。
+//
+// 没有按钮 —— 探测亚秒级就结束、框自己会消失，给个「取消」就要引入「编码流程
+// 中途被打断」的状态机，不划算。标题栏的 X 和 Alt+F4 由 Rust 侧的
+// `win_dialog::open_blocking` 挡掉。
+export component ProbingDialog inherits DialogWindow {
+    dialog-background: #FFFFFF;
+    width: 400px;
+    // 高度贴合内容，和中英文正文的行数无关（这里只有标题 + 一行说明 + 进度条）
+    height: content.preferred-height;
+    title: root.dialog-title;
+
+    in property <string> dialog-title;
+    /// 窗口的逻辑尺寸。Rust 侧要在窗口创建**之前**算出摆在哪，那会儿
+    /// `Window::size()` 还是 0，得从这个绑定读。
+    out property <length> dialog-w: root.width;
+    out property <length> dialog-h: root.height;
+
+    in property <string> message;
+    /// 0..1
+    in property <float> progress;
+
+    content := VerticalBox {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 14px;
+        padding-bottom: 16px;
+        spacing: 10px;
+
+        Text {
+            text: root.message;
+            wrap: word-wrap;
+            // 跟主界面和其它对话框上的文字一样大
+            font-size: 12px;
+        }
+
+        Rectangle {
+            // 进度条（主界面那个 ThickProgressBar 是 main.slint 里的私有组件，
+            // 跨文件拿不到，这里复刻一份同款：全高轨道 + 同高填充）
+            height: 12px;
+            horizontal-stretch: 1;
+
+            Rectangle {
+                background: #FFFFFF;
+                border-radius: 3px;
+                border-width: 1px;
+                border-color: #C8C8C8;
+                clip: true;
+
+                Rectangle {
+                    x: 1px;
+                    y: 1px;
+                    width: (parent.width - 2px) * min(1.0, max(0.0, root.progress));
+                    height: parent.height - 2px;
+                    background: #0078D4;
+                }
+            }
+        }
+    }
+}

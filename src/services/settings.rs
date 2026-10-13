@@ -1,4 +1,4 @@
-//! 应用设置持久化：界面语言保存到 `%APPDATA%\x264video4osu\settings.ini`。
+//! 应用设置持久化：界面语言保存在 exe 同目录的 `settings.ini`。
 //!
 //! 格式为简单的 `key=value` 单行（与旧程序 Settings 的扁平 INI 风格一致）：
 //!
@@ -38,15 +38,18 @@ impl Default for AppSettings {
     }
 }
 
-/// 应用设置目录：`%APPDATA%\x264video4osu`；APPDATA 缺省时回落 exe 所在目录。
+/// 应用设置目录：exe 所在目录。
+///
+/// 程序是免安装的，设置跟着 exe 走 —— 把整个文件夹拷到别的机器上，语言选择
+/// 也一起带过去。不用 `%APPDATA%`，否则「绿色版」换台机器设置就丢了。
+///
+/// 这个目录不一定可写（比如放在 Program Files 下面）。写不进去时 `save()`
+/// 会打一条警告然后放弃，只是记不住语言，不影响程序运行。
 fn settings_dir() -> PathBuf {
-    match std::env::var("APPDATA") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("x264video4osu"),
-        _ => std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_default(),
-    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_default()
 }
 
 fn settings_path() -> PathBuf {
@@ -62,7 +65,7 @@ pub fn load() -> AppSettings {
 }
 
 /// 解析设置文件内容。无法识别的行、以及超范围的值一律忽略，保留默认。
-/// 单独拆出来是为了能无头测试 —— `load()` 要读写 %APPDATA%，测不了。
+/// 单独拆出来是为了能无头测试 —— `load()` 要读磁盘上的真实文件，测不了。
 fn parse_settings(content: &str) -> AppSettings {
     let mut settings = AppSettings::default();
     for line in content.lines() {
@@ -84,13 +87,8 @@ fn parse_settings(content: &str) -> AppSettings {
     settings
 }
 
-/// 保存设置；best-effort，目录不存在则创建，IO 错误忽略。
+/// 保存设置；best-effort，IO 错误忽略（exe 放在只读目录里时就会写失败）。
 pub fn save(settings: &AppSettings) {
-    let dir = settings_dir();
-    if let Err(e) = fs::create_dir_all(&dir) {
-        eprintln!("warning: failed to create settings dir {}: {e}", dir.display());
-        return;
-    }
     let content = format!("lang={}\n", settings.lang_index);
     if let Err(e) = fs::write(settings_path(), content) {
         eprintln!("warning: failed to save settings: {e}");
@@ -100,6 +98,18 @@ pub fn save(settings: &AppSettings) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_file_sits_next_to_the_exe() {
+        // 绿色版的要求：设置放在 exe 旁边，拷走文件夹就带走了语言选择。
+        // 别改回 %APPDATA%，那样换台机器设置就没了。
+        let exe_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert_eq!(settings_path(), exe_dir.join("settings.ini"));
+    }
 
     #[test]
     fn lang_index_is_clamped_to_known_languages() {
