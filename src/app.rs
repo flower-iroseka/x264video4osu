@@ -21,7 +21,9 @@ use slint::{ComponentHandle, SharedString, Timer, TimerMode, VecModel};
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // ---------- 项目链接（对应旧程序 AppConfig；GitHubIssuesUrl 在旧程序中未被使用） ----------
@@ -173,12 +175,16 @@ pub struct AppController {
     poll_timer: Timer,
     /// 自动滚动去抖标志
     scroll_pending: Rc<Cell<bool>>,
-    /// 预览会话。None = 没有 libmpv / 还没起 / 起不来，此时预览入口整体禁用。
+    /// 预览会话。None = 没有 ffmpeg / 还没起 / 起不来，此时预览入口整体禁用。
     preview: Option<Preview>,
-    /// mpv 落脚用的子窗口句柄。0 表示还没建。
-    preview_host: isize,
-    /// 预览最近一次打开的输入文件，用来判断要不要重新 load
+    /// 已经交给后端的输入文件，用来判断要不要重新交给后端。
     preview_opened: Option<String>,
+    /// 帧率还没探到、暂时交不出去的输入文件。
+    ///
+    /// 选好文件到探测回来之间必然走到这里。等 `apply_probe` 拿到帧率后清掉，
+    /// 下一轮 `sync_preview` 再交一次。和 `preview_opened` 分开是因为换文件时
+    /// 后端里还开着上一个文件，光看「后端已经装了东西」分不出是谁装的。
+    preview_awaiting_framing: Option<String>,
     /// 当前预览文件的帧号换算方式。恒定帧率线性算，可变帧率查表。
     /// `Framing::Unknown` = 探不出来，此时帧号相关的控件禁用。
     /// 和按帧裁剪用的是同一次探测结果，两边帧号必须一致。
@@ -234,8 +240,8 @@ impl AppController {
             poll_timer: Timer::default(),
             scroll_pending: Rc::new(Cell::new(false)),
             preview: None,
-            preview_host: 0,
             preview_opened: None,
+            preview_awaiting_framing: None,
             preview_framing: Framing::Unknown,
             preview_syncing: false,
         }));
@@ -257,7 +263,7 @@ impl AppController {
         // 这里只同步界面文本。
         ui.set_language_index(rc.settings.lang_index);
         ui.set_strings(rc.strings.ui.clone());
-        // 预览按钮先藏起来，等确认 libmpv 可用、子窗口建出来了再放出来，
+        // 预览按钮先藏起来，等确认 ffmpeg 在、预览线程起来了再放出来，
         // 免得闪一下又消失。
         ui.set_preview_available(false);
 
@@ -435,6 +441,14 @@ impl AppController {
         ui.on_preview_goto_end(move || {
             if let Some(c) = w.upgrade() {
                 c.borrow_mut().preview_goto(false);
+            }
+        });
+        // 预览线程出了新帧就叫一次，别等 30ms 的轮询。逐帧连点的时候，等的就是
+        // 这一个 tick；播放时 60 fps 的素材也靠它才不会被 33 Hz 的轮询砍掉一半。
+        let w = weak.clone();
+        ui.on_preview_sync(move || {
+            if let Some(c) = w.upgrade() {
+                c.borrow_mut().sync_preview();
             }
         });
         let w = weak.clone();
@@ -998,7 +1012,10 @@ impl AppController {
     // 视频预览
     // =============================================================
 
-    /// 等窗口真的建出来，再建子窗口、起 mpv。失败就把预览入口整体藏掉。
+    /// 等窗口真的建出来，再起预览后端。失败就把预览入口整体藏掉。
+    ///
+    /// 后端自己起线程、自己开音频设备，跟 UI 线程没关系，所以这里不必等窗口，
+    /// 拖到 250ms 之后只是为了让启动先忙完手头的事。
     fn setup_preview(self_rc: &Rc<RefCell<Self>>) {
         let w = Rc::downgrade(self_rc);
         slint::Timer::single_shot(Duration::from_millis(250), move || {
@@ -1006,31 +1023,44 @@ impl AppController {
             let mut c = c.borrow_mut();
 
             if !preview::is_available() {
-                // 没有 libmpv-2.dll。预览是可选功能，不影响其它部分。
+                // 没有 tools/ffmpeg.exe。预览是可选功能，不影响其它部分。
                 c.ui.set_preview_available(false);
                 return;
             }
 
-            let main = crate::win_icon::main_window_hwnd(c.ui.window());
-            let host = if main.is_null() {
-                std::ptr::null_mut()
-            } else {
-                crate::platform::preview_window::create(main)
-            };
-            if host.is_null() {
-                c.ui.set_preview_available(false);
-                return;
-            }
-
-            match Preview::new(host) {
+            match Preview::new() {
                 Ok(p) => {
-                    c.preview_host = host as isize;
+                    // 出了新帧就让 UI 线程立刻同步一次，不等 30ms 的轮询。
+                    //
+                    // 回调是在预览自己的线程上跑的，抓不到 AppController（那个是
+                    // Rc，不是 Send），所以它只干一件事：把界面叫醒，剩下的还是
+                    // 在 UI 线程上跑普通的 sync_preview。
+                    let ui_weak = c.ui.as_weak();
+                    let queued = Arc::new(AtomicBool::new(false));
+                    p.set_frame_notify(move || {
+                        // 已经排了一次唤醒就不再排，免得 UI 线程慢的时候堆一队
+                        if queued.swap(true, Ordering::AcqRel) {
+                            return;
+                        }
+                        let ui_weak = ui_weak.clone();
+                        let inner = queued.clone();
+                        let posted = ui_weak.upgrade_in_event_loop(move |ui| {
+                            // 先放行再干活：同步过程中来的新帧才能再排一次，
+                            // 不然那一帧要白白等到下一个轮询才上屏
+                            inner.store(false, Ordering::Release);
+                            ui.invoke_preview_sync();
+                        });
+                        if posted.is_err() {
+                            // 窗口已经没了，这次没排进去，把标志放回去
+                            queued.store(false, Ordering::Release);
+                        }
+                    });
                     c.preview = Some(p);
                     // 预览一律从收起开始，不记上次的状态：窗口默认保持原来的窄宽度，
                     // 要用预览再点侧边的展开按钮。
                     c.ui.set_preview_expanded(false);
                     c.ui.set_preview_available(true);
-                    // 让预览快捷键一开始就是活的：Slint 只往有焦点的元素送按键，
+                    // 让预览快捷键一开始就是活的：Slint 只往有焦点的元素发送按键，
                     // 没元素有焦点时按键直接丢。
                     c.ui.invoke_focus_preview_keys();
                     apply_window_size(&c.ui);
@@ -1039,7 +1069,6 @@ impl AppController {
                 Err(e) => {
                     // 起不来就彻底关掉入口，别让用户点开一个空面板
                     eprintln!("preview unavailable: {e}");
-                    crate::platform::preview_window::destroy(host);
                     c.ui.set_preview_available(false);
                 }
             }
@@ -1060,8 +1089,7 @@ impl AppController {
         self.sync_preview();
     }
 
-    /// 把预览的当前状态搬到界面上，并顺手摆好 mpv 的子窗口。
-    /// 由 30ms 的轮询定时器调用。
+    /// 把预览的当前状态搬到界面上。由 30ms 的轮询定时器调用。
     fn sync_preview(&mut self) {
         if self.preview.is_none() {
             return;
@@ -1072,27 +1100,25 @@ impl AppController {
         let Some(p) = &self.preview else { return };
         let st = p.state();
 
-        // 画面区的位置随窗口尺寸/DPI/展开状态变，每轮都摆一次。SetWindowPos 很便宜。
-        let host = self.preview_host as windows_sys::Win32::Foundation::HWND;
-        if !host.is_null() {
-            let expanded = self.ui.get_preview_expanded();
-            if !expanded {
-                crate::platform::preview_window::set_visible(host, false);
-            } else {
-                let sf = self.ui.window().scale_factor() as f32;
-                let vx = self.ui.get_video_x() as f32;
-                let vy = self.ui.get_video_y() as f32;
-                let vw = self.ui.get_video_w() as f32;
-                let vh = self.ui.get_video_h() as f32;
-                // Slint 画那块矩形时，边界铺满它跨到的整格设备像素（左边 floor、
-                // 右边 ceil）。子窗口得用同一套算法，不然 125% 缩放下两边差出半格，
-                // 黑底占位矩形会在画面左边露出一条黑边（右边不会，方向反着）。
-                let x = (vx * sf).floor() as i32;
-                let y = (vy * sf).floor() as i32;
-                let w = ((vx + vw) * sf).ceil() as i32 - x;
-                let h = ((vy + vh) * sf).ceil() as i32 - y;
-                crate::platform::preview_window::place(host, x, y, w, h);
-                crate::platform::preview_window::set_visible(host, true);
+        // 有新帧就换上去，没有就不动。画面本身的位置尺寸由 Slint 的布局算，
+        // 这里不用管。
+        if let Some(img) = p.take_frame() {
+            self.ui.set_preview_frame(img);
+            // Slint 的 winit 后端在 Windows 上把重绘压在一个按刷新率跑的节流定时器上
+            // （i-slint-backend-winit 的 frame_throttle.rs，TimerBasedFrameThrottle），
+            // 定时器第一次触发要等满一个刷新周期，所以设完属性到画面真的画出来固定要
+            // 16.7 ms。暂停逐帧等的就是这一段：直接给窗口标脏，系统发 WM_PAINT，
+            // winit 在 WM_PAINT 里立刻转成 RedrawRequested，就绕开了那个定时器。
+            //
+            // 只在暂停时做。播放中本来就按显示刷新率出帧，节流定时器正合适，这时再
+            // 强制标脏会变成一帧画两遍。
+            if st.paused {
+                let hwnd = self.main_hwnd();
+                if !hwnd.is_null() {
+                    unsafe {
+                        windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
+                    }
+                }
             }
         }
 
@@ -1131,19 +1157,25 @@ impl AppController {
         self.ui.set_preview_muted(st.mute);
     }
 
-    /// 输入文件变了就把新文件塞给 mpv。没变则什么都不做。
+    /// 输入文件变了就把新文件交给预览后端。没变则什么都不做。
     fn reload_preview_source(&mut self) {
-        let Some(p) = &self.preview else { return };
-        let path = self.ui.get_input_path().to_string();
-        if path.trim().is_empty() || self.preview_opened.as_deref() == Some(path.as_str()) {
+        if self.preview.is_none() {
             return;
         }
-        if !Path::new(&path).exists() {
+        // 用归一化之后的绝对路径。输入框里的字是用户打的，可能是相对路径、正斜杠
+        // 或者前后带了空格，原样存进 `preview_opened` / `preview_awaiting_framing`
+        // 的话，`apply_probe` 那边拿 `current_input_path()` 来比就永远对不上。
+        let path = self.current_input_path();
+        if path.is_empty() || !Path::new(&path).exists() {
             return;
         }
-        p.set_paused(true);
-        p.open(Path::new(&path));
-        self.preview_opened = Some(path);
+        if self.preview_opened.as_deref() == Some(path.as_str()) {
+            return;
+        }
+        // 已经为这个文件在等帧率了，不必每 30ms 重算一遍上面的东西
+        if self.preview_awaiting_framing.as_deref() == Some(path.as_str()) {
+            return;
+        }
         // 帧号换算要帧率。和按帧裁剪走同一次探测，别另起一套，
         // 否则「当前帧为开头」填进去的帧号和编码时算的对不上。
         self.preview_framing = self.current_framing();
@@ -1157,6 +1189,39 @@ impl AppController {
             _ => 16.0 / 9.0,
         };
         self.ui.set_video_aspect(aspect);
+
+        // 帧率还没探到就先不放。解码出来的帧要靠 Framing 换算时间，拿不到帧率
+        // 就只能按错的帧率放，帧号会整片偏掉。选好文件到探测回来之间必然走到这里，
+        // 探测结果到了 apply_probe 会把标记清掉再叫一次。
+        if !self.preview_framing.is_valid() {
+            self.preview_awaiting_framing = Some(path);
+            return;
+        }
+        self.open_preview_source(path);
+    }
+
+    /// 把文件交给预览后端，并从这一份探测结果里带上时长和有没有音轨。
+    ///
+    /// 后端自己不看文件：时长和音轨有无都从 `last_probe` 拿，保证预览和编码对
+    /// 同一个文件得出的是同一套结论。
+    fn open_preview_source(&mut self, path: String) {
+        let duration = self.last_probe.as_ref().map_or(0.0, |p| p.duration);
+        let has_audio = self
+            .last_probe
+            .as_ref()
+            .is_some_and(|p| p.audio_codec.is_some());
+        if let Some(p) = &self.preview {
+            // 开文件时先停着：让用户看到第一帧再决定从哪儿放
+            p.set_paused(true);
+            p.open(
+                Path::new(&path),
+                self.preview_framing.clone(),
+                duration,
+                has_audio,
+            );
+        }
+        self.preview_opened = Some(path);
+        self.preview_awaiting_framing = None;
         // 换文件了，输入框回到起点
         self.set_preview_inputs(0.0);
     }
@@ -1484,6 +1549,16 @@ impl AppController {
             self.ui.set_video_aspect(aspect);
         }
 
+        // 预览当时因为帧率还没探到没有装载。把标记清掉，下一轮 sync_preview
+        // 就会带着现在这份帧率把它交给后端。
+        //
+        // 只看「后端里有没有装着东西」是不够的：换文件时后端里还开着上一个
+        // 文件，那样判断会让标记永远清不掉，新文件再也交不进去（旧文件一直播）。
+        let current = self.current_input_path();
+        if self.preview_awaiting_framing.as_deref() == Some(current.as_str()) {
+            self.preview_awaiting_framing = None;
+        }
+
         // 探测期间切过裁剪单位的话，那次换算被打回去了，这里补一次。
         // 只在真的欠着一次换算的时候调：`convert_trim_texts` 是「从另一个单位换到
         // 当前单位」，无条件调会把用户手填的帧号当成时间戳再换一遍。
@@ -1522,12 +1597,9 @@ impl AppController {
         if let Some(log) = &self.current_log_path {
             cleanup_temp_files_public(log);
         }
-        // 先丢预览（Drop 里销毁 mpv，mpv 会放开它引用的那个窗口），
-        // 再销毁子窗口。顺序反了的话 mpv 会去操作一个已经不存在的句柄。
+        // 丢预览会停掉解码子进程、音频设备和工作线程，所以这里会阻塞一小会儿
+        // （join 三条线程）。播放中关窗口走的就是这条路。
         self.preview = None;
-        let host = self.preview_host as windows_sys::Win32::Foundation::HWND;
-        crate::platform::preview_window::destroy(host);
-        self.preview_host = 0;
     }
 
     // =============================================================

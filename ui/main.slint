@@ -416,9 +416,8 @@ export component MainWindow inherits Window {
     out property <length> preview-gap: 6px;
     out property <length> preview-controls-h: root.slider-h + root.control-row-h * 2
         + root.preview-gap * 3;
-    // 画面外圈那层边框：1px 空隙 + 1px 边线。边线必须画在 mpv 子窗口**外面**——
-    // 子窗口是原生窗口，盖在 Slint 画的所有东西上面，边线只要和它重叠就会被吃掉。
-    // 留的这 1px 空隙顺带兜住子窗口对齐设备像素时最多 1 个设备像素的外溢。
+    // 画面外圈那层边框：1px 空隙 + 1px 边线。留这 1px 空隙是为了不管画面什么
+    // 比例，边线和画帧之间都隔着一条底色。
     out property <length> video-frame: 2px;
     // 画面宽高比，由 app.rs 探测到后写进来；没有视频时按 16:9
     in property <float> video-aspect: 1.7777778;
@@ -442,7 +441,7 @@ export component MainWindow inherits Window {
     out property <length> video-y: root.preview-top + root.video-frame;
     // 展开状态。app.rs 启动时一律置为收起，不记上次的状态。
     in-out property <bool> preview-expanded: false;
-    // 预览不可用（没有 libmpv-2.dll）时整个展开按钮和预览列都不出现。
+    // 预览不可用（找不到 tools/ffmpeg.exe）时整个展开按钮和预览列都不出现。
     in property <bool> preview-available: true;
 
     background: Palette.background;
@@ -505,8 +504,10 @@ export component MainWindow inherits Window {
     callback scroll-log-to-end();
 
     // ---------- 预览面板 ----------
-    // 状态由 app.rs 每 30ms 从 mpv 那边读一次后写进来。
+    // 状态由 app.rs 每 30ms 从预览后端读一次后写进来。
     in-out property <bool> preview-loaded: false;
+    // 当前要显示的画帧。后端出新帧时 app.rs 才写它，没新帧就不写。
+    in property <image> preview-frame;
     in-out property <bool> preview-paused: true;
     // 当前位置 / 总时长，两个拼起来显示成「当前时间 / 视频总时间」
     in property <string> preview-time-text: "00:00:00.000";
@@ -518,11 +519,11 @@ export component MainWindow inherits Window {
     // 两个输入框：帧号和时间戳。改任意一个，app.rs 立刻把另一个换算成对应值写回来。
     in-out property <string> preview-frame-input: "0";
     in-out property <string> preview-time-input: "00:00:00.000";
-    // 进度条位置，量程 0..1000（滑块本身就是这个量程）。app.rs 按 mpv 的播放位置写它，
+    // 进度条位置，量程 0..1000（滑块本身就是这个量程）。app.rs 按当前显示帧的位置写它，
     // 但拖动期间（preview-scrubbing 为真）不写，免得把用户刚拖到的位置又拽回去。
     in-out property <float> preview-seek-1000: 0.0;
     in-out property <bool> preview-scrubbing: false;
-    // 音量条位置 0..100，和 mpv 的 volume 一一对应（volume-max 那边也设成了 100）。
+    // 音量条位置 0..100，和后端的音量一一对应（后端的 VOLUME_MAX 也是 100）。
     // 拖动期间（preview-vol-dragging 为真）app.rs 不写它，理由和进度条一样。
     in-out property <float> preview-volume: 100.0;
     in-out property <bool> preview-vol-dragging: false;
@@ -542,6 +543,8 @@ export component MainWindow inherits Window {
     callback preview-toggle-mute();
     callback preview-goto-start();       // 跳到视频开头
     callback preview-goto-end();         // 跳到视频结尾
+    // 预览出了新帧，让界面立刻同步一次。由预览线程发起，比 30ms 的轮询快得多。
+    callback preview-sync();
     callback preview-frame-edited(string);   // 用户改了帧号框
     callback preview-time-edited(string);    // 用户改了时间戳框
     callback preview-jump-to-input();        // 跳到输入框指定的位置
@@ -618,7 +621,7 @@ export component MainWindow inherits Window {
                     }
                     accept
                 } else if (event.text == Key.UpArrow) {
-                    // 交给 Rust 侧按 mpv 的实时音量加，别拿界面那份轮询快照加：
+                    // 交给 Rust 侧按实时音量加，别拿界面那份轮询快照加：
                     // 连按两下会都按同一个旧值算，只涨一档
                     root.preview-volume-step(5);
                     accept
@@ -934,7 +937,6 @@ export component MainWindow inherits Window {
 
         // ---- 预览列 ----
         // 收起时宽度为 0，完全不占地方；展开后从主体右边缘往右铺开。
-        // 画面区那块矩形只是个占位：mpv 的原生子窗口会由 app.rs 摆到它上面。
         Rectangle {
             x: root.main-w;
             y: 0px;
@@ -952,28 +954,31 @@ export component MainWindow inherits Window {
                 padding-bottom: root.preview-top;
                 spacing: root.preview-gap;
 
-                // 画面外圈 + 占位。宽高按视频真实比例算，Rust 侧按同一份 video-*
-                // 摆 mpv 子窗口。
+                // 画面：外圈一层 1px 灰边，里面是画帧。宽高按视频真实比例算。
                 // 外面套一层 HorizontalLayout 是为了水平居中：VerticalBox 里固定宽度的
                 // 子元素是靠左摆的，而 video-x 按居中算，不套这一层两者会差出半个余量，
-                // 4:3 这类窄画面下就能看到占位矩形和画面错开一条边。
+                // 4:3 这类窄画面下就能看到边框和面板中心错开一条边。
                 HorizontalLayout {
                     vertical-stretch: 0;
                     alignment: center;
-                    // 1px 灰边，颜色和宽度都跟设置页的内边框一致。边线和里面那张黑底
-                    // 占位之间留 1px 空隙：边线画在子窗口外面才不会被它盖掉。
+                    // 1px 灰边，颜色和宽度都跟设置页的内边框一致。
                     Rectangle {
                         width: root.video-w + root.video-frame * 2;
                         height: root.video-h + root.video-frame * 2;
                         border-width: 1px;
                         border-color: #E0E0E0;
+                        // 黑底留着：还没加载文件、或者解码出的画帧比例和探测到的
+                        // 不一致时（contain 会留边），露出来的就是它
+                        background: #000000;
 
-                        Rectangle {
+                        Image {
                             x: root.video-frame;
                             y: root.video-frame;
                             width: root.video-w;
                             height: root.video-h;
-                            background: #000000;
+                            source: root.preview-frame;
+                            // 后端固定按 640×360 出帧，宽高比交给这里兜
+                            image-fit: contain;
                         }
                     }
                 }
@@ -1106,9 +1111,9 @@ export component MainWindow inherits Window {
                             // x 按这个范围换算成 0..100，取整后和浮出来的数字对得上。
                             //
                             // 每动一下要做两件事：改 preview-volume（滑块和浮出来的
-                            // 数字看的是它）和发 preview-set-volume（那段通往 mpv）。
-                            // 拖动期间 app.rs 不回写 preview-volume，光发回调的话
-                            // 滑块会一直停在旧值上。
+                            // 数字看的是它）和发 preview-set-volume（那个回调一路送到
+                            // 音频线程）。拖动期间 app.rs 不回写 preview-volume，
+                            // 光发回调的话滑块会一直停在旧值上。
                             vol-touch := TouchArea {
                                 enabled: root.preview-controls-on;
                                 // 算一次放这儿，down 和 moved 里都读它
@@ -1254,10 +1259,8 @@ export component MainWindow inherits Window {
             }
         }
 
-        // 按钮的悬停提示。没用内建的 Tooltip：那个按鼠标位置弹，按钮正好在窗口
-        // 竖直中间那一道，展开后提示框会压在 mpv 子窗口底下（子窗口是原生窗口，
-        // 盖在 Slint 画的所有东西上面），只露出左边一条。这里固定画在按钮左侧，
-        // 那块地方是设置面板，两种状态下都完整可见。
+        // 按钮的悬停提示。没用内建的 Tooltip：那个按鼠标位置弹，会盖住画面区。
+        // 这里固定画在按钮左侧，落点是设置面板，两种状态下都完整可见。
         Rectangle {
             visible: root.preview-available && expand-touch.has-hover;
             x: expand-btn.x - self.width - 6px;

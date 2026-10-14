@@ -1,87 +1,80 @@
-//! 视频预览：用 libmpv 在主窗口里嵌一块播放画面。
+//! 视频预览：两个 ffmpeg 子进程解码，画面交给 Slint 自己画，声音走 WASAPI。
 //!
-//! ## 为什么是 libmpv + 子窗口
+//! ## 怎么放的
 //!
-//! 主窗口是 Slint 的 femtovg(OpenGL) 渲染的，想让画面进去有两条路：把 mpv 的渲染
-//! 塞进已有的 GL 上下文（render API），或者让 mpv 自己开一个原生子窗口。选了后者 ——
-//! femtovg 在本项目里是 vendored 且打过 DPI 补丁的，共用上下文的耦合太深。
+//! 视频子进程把画面解成固定 640×360 的 `rgb24` 从 stdout 吐出来，每帧 691200 字节
+//! 整读进 `SharedPixelBuffer`，转成 `slint::Image` 交给 UI；音频子进程出 PCM，
+//! WASAPI 渲染到设备上，同时用 `IAudioClock` 当主时钟。
 //!
-//! 做过验证（`examples/preview_spike.rs`）：在窗口客户区里建一个子窗口，把句柄用
-//! `wid` 交给 mpv，画面、声音、Slint 界面三者都正常。
+//! 之前是 libmpv 加一块原生子窗口。换掉之后发布包里少一个 101 MB 的 DLL，而 ffmpeg
+//! 本来就要随程序发。
 //!
-//! ## 线程模型
+//! ## 时间轴
 //!
-//! mpv 的全部交互都跑在**一条工作线程**上，UI 线程不直接碰 mpv：
-//! UI 通过 [`Preview::open`] 等方法把命令丢进通道，每 30ms 从 [`Preview::state`]
-//! 读一次最新状态（和 `FfmpegService` 那套「后台线程 + UI 轮询」保持一致）。
+//! 每帧的源时间不是从 ffmpeg 那边读来的，是用 [`Framing`] 算的：本次会话第一帧的
+//! 源帧号是 `framing.first_frame_at_or_after(seek)`，第 i 帧的源时间就是
+//! `framing.frame_to_secs(frame0 + i)`。这样播放和裁剪打点用的是同一个映射，
+//! 而不是两套碰巧对得上的东西。
 //!
-//! 这么做还有个好处：`mpv_handle` 的裸指针从来不需要跨线程传递。
+//! 这条成立的前提是 `preview_media::video_args` 里那个 `-fps_mode:v passthrough`：
+//! 少了它 ffmpeg 会按自己的帧率策略补帧丢帧，帧号和时间立刻对不上。
 //!
-//! ## DLL
+//! ## 线程
 //!
-//! `tools/libmpv-2.dll`，运行时用 `libloading` 动态加载，不引入编译期链接依赖。
-//! 找不到就是预览不可用（[`Preview::is_available`] 返回 false），程序其余部分照常。
+//! * 控制线程：收命令、开关文件和子进程、跳转。COM 和音频设备都归它。
+//! * 调度线程：看时钟走到哪儿，把该显示的那一帧挑出来放进出帧口。
+//! * 音频渲染线程：[`AudioEngine::render_loop`]。
+//! * 每条会话自己再起两条读数线程（视频管道、PCM 管道），随会话一起进退。
+//!
+//! UI 线程一个都不碰，也不初始化 COM。**这一点是硬要求**：winit 建窗口时会把 UI
+//! 线程按 STA 初始化（`OleInitialize`），在那之后同一个线程再要 MTA 会直接失败。
+//! 所以音频设备必须在预览自己的线程上开。
+//!
+//! ## 发布的是哪一刻
+//!
+//! [`PreviewState::time_pos`] 发布的是**当前显示那一帧自己的时间**，不是时钟时间。
+//! 时钟天然领先画面不到一帧；暂停时它冻在"已渲染"的位置，队列里还压着约 100 ms
+//! 音频，从它算出来的位置只会更旧。打点工具要的是"我正在看的这一帧"。
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::HWND;
+use slint::Image;
 
-/// 随程序分发的 libmpv 文件名。
-///
-/// 注意是 `libmpv-2.dll` 而不是 `mpv-2.dll` —— dev 包里就是这个名字。
-///
-/// 分发的是 LGPL 构建（zhongfly/mpv-winbuild 的 `mpv-dev-lgpl-x86_64-*.7z`，
-/// 构建参数里带 `-Dgpl=false`），不是 mpv 默认的 GPL 构建。本项目按 MIT 发布，
-/// 用 GPL 版的 libmpv 会要求整个程序跟着变 GPL；LGPL 版没这个约束，换 DLL 的时候
-/// 别拿错了。
-const LIBMPV_FILE: &str = "libmpv-2.dll";
+use crate::platform::wasapi::{self, AudioEngine};
+use crate::services::preview_media::{AudioSpec, Frame, FrameRing, FrameSecs, Session, SourceSpec};
+use crate::services::probe::Framing;
 
-// ---- libmpv 的常量和结构（对着 include/mpv/client.h 抄） ----
-
-const MPV_FORMAT_FLAG: c_int = 3;
-const MPV_FORMAT_DOUBLE: c_int = 5;
-
-const MPV_EVENT_NONE: c_int = 0;
-const MPV_EVENT_SHUTDOWN: c_int = 1;
-
-/// `mpv_event`。注意 `event_id` 在 C 里是枚举（int），不是 64 位。
-#[repr(C)]
-struct MpvEvent {
-    event_id: c_int,
-    error: c_int,
-    reply_userdata: u64,
-    data: *mut c_void,
-}
-
-/// 从 DLL 里解析出来的入口。签名逐个对着 `client.h` 核过。
-struct MpvFns {
-    create: unsafe extern "C" fn() -> *mut c_void,
-    initialize: unsafe extern "C" fn(*mut c_void) -> c_int,
-    terminate_destroy: unsafe extern "C" fn(*mut c_void),
-    set_option_string: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int,
-    command: unsafe extern "C" fn(*mut c_void, *const *const c_char) -> c_int,
-    set_property: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int,
-    get_property: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int,
-    wait_event: unsafe extern "C" fn(*mut c_void, f64) -> *mut MpvEvent,
-    error_string: unsafe extern "C" fn(c_int) -> *const c_char,
-}
-
-/// 音量上限。mpv 默认允许到 130（当放大器用），这里收在 100，
-/// 滑块 0..100 才和实际音量一一对应。
+/// 音量上限。滑块 0..100 正好和实际音量一一对应（界面值是百分比）。
 pub const VOLUME_MAX: f64 = 100.0;
+
+/// PCM 环留几秒的量。够吸收跳转时子进程启动的抖动，又不至于让暂停期间积压无限涨。
+const PCM_SECS: usize = 4;
+
+/// 离下一帧还差这么点时间就不再睡、改成自旋收尾。一帧 41.7 ms 里自旋 1 ms，
+/// 占一个核的 2% 上下。理由见 [`sched_loop`] 里那段注释。
+const SPIN_SECS: f64 = 0.001;
+
+/// 起子进程到第一帧的等待上限
+const FIRST_FRAME_LIMIT: Duration = Duration::from_millis(2000);
+/// 等第一帧时每次醒来看一眼的间隔。分小段是为了被叫停时能很快退出来。
+const AWAIT_STEP_MS: u64 = 5;
+/// 跳转后等设备缓冲攒够的上限
+const PRIME_LIMIT: Duration = Duration::from_millis(400);
+/// 控制线程多久醒一次看看有没有被叫停
+const CONTROL_TICK: Duration = Duration::from_millis(20);
 
 /// 预览面板要显示的状态。UI 每 30ms 取一次。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PreviewState {
-    /// 已经装进一个文件（mpv 不在 idle）
+    /// 文件已经装载并且能放
     pub loaded: bool,
     pub paused: bool,
-    /// 当前播放位置（秒）；没加载文件时为 0
+    /// 当前显示那一帧的源时间（秒）；没加载文件时为 0
     pub time_pos: f64,
     /// 总时长（秒）；未知时为 0
     pub duration: f64,
@@ -92,8 +85,8 @@ pub struct PreviewState {
 
 impl Default for PreviewState {
     fn default() -> Self {
-        // 不能 derive：derive 出来的 volume 是 0（静音），而 mpv 的初始音量是 100。
-        // 状态还没读到之前界面会先按这个默认值画，用 0 的话滑块会先闪到最左边。
+        // 不能 derive：derive 出来的 volume 是 0（静音），状态还没读到之前界面会按
+        // 这个默认值先画一帧，滑块于是先闪到最左边。
         Self {
             loaded: false,
             paused: false,
@@ -116,11 +109,19 @@ impl PreviewState {
     }
 }
 
+/// UI 发来的打开请求。
+struct OpenRequest {
+    path: PathBuf,
+    framing: Framing,
+    duration: f64,
+    has_audio: bool,
+}
+
 /// UI 发给预览线程的命令。
 enum Command {
-    Open(PathBuf),
+    Open(Box<OpenRequest>),
     SetPaused(bool),
-    /// 播放/暂停取反，由工作线程读实时状态决定方向。
+    /// 播放/暂停取反，由控制线程读实时状态决定方向。
     TogglePlay,
     Seek(f64),
     /// 相对当前位置跳，单位秒，可负。
@@ -129,58 +130,77 @@ enum Command {
     StepFrames(i64),
     /// 音量，0..=[`VOLUME_MAX`]
     SetVolume(f64),
-    /// 在当前音量上加减，由工作线程读实时值。快捷键用，理由同 [`Command::ToggleMute`]。
+    /// 在当前音量上加减，由控制线程读实时值。快捷键用，理由同 [`Command::ToggleMute`]。
     StepVolume(f64),
-    /// 静音取反，同样由工作线程读实时状态。
+    /// 静音取反，同样由控制线程读实时状态。
     ToggleMute,
 }
 
-/// 预览会话。持有它就代表预览开着；`Drop` 会停掉工作线程并销毁 mpv。
+/// 预览会话。持有它就代表预览开着；`Drop` 会停掉控制线程、子进程和音频设备。
 pub struct Preview {
     cmd_tx: Sender<Command>,
     state: Arc<Mutex<PreviewState>>,
+    /// 等 UI 取走的帧
+    out: Arc<Mutex<Outbox>>,
     stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    /// `loadfile` 之后 mpv 是异步加载的，这里记一下最近一次请求，
-    /// 免得在真正加载完成前就把 `open` 当成失败。
-    _last_path: PathBuf,
+    thread: Option<JoinHandle<()>>,
 }
 
-/// libmpv 在本机是否可用（DLL 在不在）。
+/// 出帧口：调度线程把该显示的帧放进来，UI 线程取走。
+///
+/// `notify` 是界面登记的推送回调。登记了的话，放帧时顺手叫它一声，界面立刻就
+/// 同步，不用等下一个 30 ms 轮询——逐帧连点时的延迟从 0~30 ms 掉到几毫秒，
+/// 播放也从轮询的 33 Hz 上限提到跟着显示器刷新率走：拿 60 fps 的素材量过，
+/// 调度线程每秒推 60 帧、界面每秒取 60 帧、每秒画 60 次，其中 56~59 次画的是
+/// 新帧，也就是一秒钟真的换掉五十八九张画面，而不是被砍到 33。没登记（测试里、
+/// 或者窗口已经没了）就还是原来那样等 UI 来取。
+#[derive(Default)]
+struct Outbox {
+    frame: Option<Frame>,
+    notify: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// 放一帧进去，登记了推送回调就叫它一声。
+///
+/// 回调是在放帧的那条线程上跑的，只该做「把 UI 线程叫醒」这一件事；真正的
+/// 搬帧、设属性、重绘都回到 UI 线程上做，所以这里先把锁放掉再叫。
+fn put_frame(out: &Mutex<Outbox>, f: Frame) {
+    let cb = {
+        let mut g = out.lock().unwrap();
+        g.frame = Some(f);
+        g.notify.clone()
+    };
+    if let Some(cb) = cb {
+        cb();
+    }
+}
+
+/// 预览能不能用：ffmpeg 在不在。缺了就是预览入口藏起来，程序其余部分照常。
 pub fn is_available() -> bool {
-    libmpv_path().exists()
-}
-
-fn libmpv_path() -> PathBuf {
-    crate::services::ffmpeg_config::tool_path(LIBMPV_FILE)
+    crate::services::ffmpeg_config::ffmpeg_path().exists()
 }
 
 impl Preview {
-    /// 起一个预览会话，把画面挂到 `wid` 这个子窗口上。
+    /// 起一个预览会话。
     ///
-    /// 内部要等 mpv 初始化完才返回，所以是阻塞的（正常几毫秒）。失败时返回错误描述，
-    /// 调用方据此把预览入口禁掉。
-    pub fn new(wid: HWND) -> Result<Self, String> {
-        Self::start(wid, &[])
-    }
-
-    /// `extra_options` 是给测试用的补充选项（比如关掉音频），正常调用传空。
-    fn start(wid: HWND, extra_options: &'static [(&'static str, &'static str)]) -> Result<Self, String> {
-        let (cmd_tx, cmd_rx) = channel::<Command>();
-        let (ready_tx, ready_rx) = channel::<Result<(), String>>();
+    /// 内部要等控制线程把音频设备和调度线程都准备好才返回，所以是阻塞的
+    /// （正常几十毫秒）。失败时返回错误描述，调用方据此把预览入口禁掉。
+    ///
+    /// 音频设备开不起来不算失败：没声音也照样放画面，只往 stderr 记一行。
+    pub fn new() -> Result<Self, String> {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
         let state = Arc::new(Mutex::new(PreviewState::default()));
+        let out = Arc::new(Mutex::new(Outbox::default()));
         let stop = Arc::new(AtomicBool::new(false));
 
         let thread = {
             let state = state.clone();
+            let out = out.clone();
             let stop = stop.clone();
-            // HWND 是裸指针，不是 Send；转成 isize 传进去再转回来。
-            let wid = wid as isize;
             std::thread::Builder::new()
-                .name("mpv-preview".into())
-                .spawn(move || {
-                    worker(wid as HWND, extra_options, cmd_rx, ready_tx, state, stop);
-                })
+                .name("preview-ctl".into())
+                .spawn(move || worker(cmd_rx, ready_tx, state, out, stop))
                 .map_err(|e| format!("创建预览线程失败：{e}"))?
         };
 
@@ -188,10 +208,12 @@ impl Preview {
             Ok(Ok(())) => Ok(Self {
                 cmd_tx,
                 state,
+                out,
                 stop,
                 thread: Some(thread),
-                _last_path: PathBuf::new(),
             }),
+            // 控制线程已经退出了，那个 JoinHandle 不用再管；上面那个 `cmd_tx`
+            // 在返回时析构，它那边的 recv 会立刻断开，不会多留一条线。
             Ok(Err(e)) => Err(e),
             Err(_) => Err("预览线程启动超时".into()),
         }
@@ -202,9 +224,38 @@ impl Preview {
         *self.state.lock().unwrap()
     }
 
-    /// 换一个文件。同样是异步的，真正加载完看 [`PreviewState::loaded`]。
-    pub fn open(&self, path: &Path) {
-        let _ = self.cmd_tx.send(Command::Open(path.to_path_buf()));
+    /// 取走当前该显示的那一帧。没有新帧就返回 `None`。
+    ///
+    /// 调度线程已经把帧挑好了，这里只是把它包成 `slint::Image`：
+    /// `SharedPixelBuffer` 是引用计数的，像素一个字节都不搬。
+    ///
+    /// 登记的推送回调会叫 UI 立刻来取；没登记（测试里、或者窗口已经没了）就靠
+    /// UI 那个 30ms 轮询。
+    pub fn take_frame(&self) -> Option<Image> {
+        let f = self.out.lock().unwrap().frame.take()?;
+        Some(f.to_image())
+    }
+
+    /// 登记推送回调：有新帧放进出帧口时叫一下。
+    ///
+    /// 回调在预览自己的线程上跑，必须很快返回，而且不能碰 `Preview` 上的东西
+    /// （那条线程正锁着出帧口）。正常就一件事：让 UI 线程醒过来同步一次。
+    pub fn set_frame_notify(&self, f: impl Fn() + Send + Sync + 'static) {
+        self.out.lock().unwrap().notify = Some(Arc::new(f));
+    }
+
+    /// 换一个文件。
+    ///
+    /// `framing` 和 `duration` 由调用方给，后端自己不去探：帧↔时间的那套映射必须
+    /// 和编码、裁剪打点用同一份，另探一份早晚会对不上。`has_audio` 同理，
+    /// 判断有没有音轨也要动 probe，不该在这里再跑一遍。
+    pub fn open(&self, path: &Path, framing: Framing, duration: f64, has_audio: bool) {
+        let _ = self.cmd_tx.send(Command::Open(Box::new(OpenRequest {
+            path: path.to_path_buf(),
+            framing,
+            duration,
+            has_audio,
+        })));
     }
 
     pub fn set_paused(&self, paused: bool) {
@@ -213,21 +264,20 @@ impl Preview {
 
     /// 播放/暂停取反。
     ///
-    /// 不用 `set_paused(!state().paused)`：`state()` 是轮询出来的快照，
-    /// 长按空格时的自动重复会连着发好几条命令，拿旧快照算就会翻错。
-    /// 交给握着 mpv 的那个线程读实时值。
+    /// 不用 `set_paused(!state().paused)`：`state()` 是轮询出来的快照，长按空格时的
+    /// 自动重复会连着发好几条命令，拿旧快照算就会翻错。交给控制线程读实时值。
     pub fn toggle_paused(&self) {
         let _ = self.cmd_tx.send(Command::TogglePlay);
     }
 
-    /// 跳到绝对位置（秒）。精确 seek，用在进度条松手之后。
+    /// 跳到绝对位置（秒）。精确到帧，用在进度条松手之后。
     pub fn seek(&self, secs: f64) {
         if secs.is_finite() && secs >= 0.0 {
             let _ = self.cmd_tx.send(Command::Seek(secs));
         }
     }
 
-    /// 相对当前位置跳（秒，可负）。快捷键用，两端由 mpv 自己夹住。
+    /// 相对当前位置跳（秒，可负）。快捷键用，两端会被夹住。
     pub fn seek_by(&self, secs: f64) {
         if secs.is_finite() && secs != 0.0 {
             let _ = self.cmd_tx.send(Command::SeekBy(secs));
@@ -250,7 +300,7 @@ impl Preview {
 
     /// 在当前音量上加减 `delta`。快捷键用。
     ///
-    /// 和 [`Preview::toggle_paused`] 一样交给工作线程算：`state()` 是轮询出来的
+    /// 和 [`Preview::toggle_paused`] 一样交给控制线程算：`state()` 是轮询出来的
     /// 快照，连按 ↑ 时几条命令都拿同一份旧值加 5，结果只涨了一档。
     pub fn step_volume(&self, delta: f64) {
         if delta.is_finite() && delta != 0.0 {
@@ -258,7 +308,7 @@ impl Preview {
         }
     }
 
-    /// 静音取反。和 [`Preview::toggle_paused`] 一样，交给工作线程读实时值，
+    /// 静音取反。和 [`Preview::toggle_paused`] 一样，交给控制线程读实时值，
     /// 免得连按 M 时拿旧快照翻错。
     pub fn toggle_mute(&self) {
         let _ = self.cmd_tx.send(Command::ToggleMute);
@@ -274,410 +324,740 @@ impl Drop for Preview {
     }
 }
 
-/// 预览线程：加载 DLL、建 mpv、装到子窗口上、然后跑命令/事件循环。
+// ------------------------------------------------------------------ 时钟
+
+/// 会话内的时间，微秒。跳转时归零，暂停时冻住。
+///
+/// 有音轨就用 WASAPI 的设备时钟，没有就自己数墙钟。两边对外是一个形状，
+/// 调度那边不用分叉。
+enum Clock {
+    Audio(Arc<AudioEngine>),
+    Wall {
+        t_ref: Instant,
+        /// 零点在 `t_ref` 上的位置
+        base_ns: AtomicU64,
+        /// 暂停时刻的位置
+        frozen_ns: AtomicU64,
+        running: AtomicBool,
+    },
+}
+
+impl Clock {
+    fn wall() -> Clock {
+        Clock::Wall {
+            t_ref: Instant::now(),
+            base_ns: AtomicU64::new(0),
+            frozen_ns: AtomicU64::new(0),
+            running: AtomicBool::new(false),
+        }
+    }
+
+    fn local_us(&self) -> i64 {
+        match self {
+            Clock::Audio(e) => e.local_us(),
+            Clock::Wall {
+                t_ref,
+                base_ns,
+                frozen_ns,
+                running,
+            } => {
+                if !running.load(Ordering::Acquire) {
+                    return (frozen_ns.load(Ordering::Acquire) / 1000) as i64;
+                }
+                let now = t_ref.elapsed().as_nanos() as u64;
+                (now.saturating_sub(base_ns.load(Ordering::Acquire)) / 1000) as i64
+            }
+        }
+    }
+
+    /// 暂停。设备时钟是把当前值冻住再停流——顺序不能反，停完就问不出位置了。
+    fn pause(&self) {
+        match self {
+            Clock::Audio(e) => e.pause(),
+            Clock::Wall {
+                t_ref,
+                base_ns,
+                frozen_ns,
+                running,
+            } => {
+                if !running.load(Ordering::Acquire) {
+                    return;
+                }
+                let now = t_ref.elapsed().as_nanos() as u64;
+                frozen_ns.store(
+                    now.saturating_sub(base_ns.load(Ordering::Acquire)),
+                    Ordering::Release,
+                );
+                running.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    /// 把本次会话的时间归零，顺便停下。接着播要再 [`Clock::resume`]。
+    fn reset(&self) {
+        match self {
+            Clock::Audio(e) => e.reset(),
+            Clock::Wall {
+                t_ref,
+                base_ns,
+                frozen_ns,
+                running,
+            } => {
+                running.store(false, Ordering::Release);
+                frozen_ns.store(0, Ordering::Release);
+                base_ns.store(t_ref.elapsed().as_nanos() as u64, Ordering::Release);
+            }
+        }
+    }
+
+    /// 从暂停或者归零状态接着走。
+    fn resume(&self) {
+        match self {
+            Clock::Audio(e) => e.start(),
+            Clock::Wall {
+                t_ref,
+                base_ns,
+                frozen_ns,
+                running,
+            } => {
+                if running.load(Ordering::Acquire) {
+                    return;
+                }
+                let frozen = frozen_ns.load(Ordering::Acquire);
+                let now = t_ref.elapsed().as_nanos() as u64;
+                base_ns.store(now.saturating_sub(frozen), Ordering::Release);
+                running.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------ 调度
+
+/// 控制线程和调度线程共享的那部分：现在放哪个环、从哪儿起、走不走设备时钟。
+struct Live {
+    ring: Option<Arc<FrameRing>>,
+    /// 当前文件的帧号→时间映射
+    map: Option<FrameSecs>,
+    /// 本次会话起点在源文件里的秒数
+    seek: f64,
+    /// 本次会话是不是真的在走设备时钟
+    audio: bool,
+}
+
+struct Sched {
+    /// 有音轨时用的设备时钟。没开出设备就没有这个。
+    device: Option<Arc<Clock>>,
+    /// 没音轨时自己数的墙钟
+    wall: Arc<Clock>,
+    live: Arc<Mutex<Live>>,
+    out: Arc<Mutex<Outbox>>,
+    state: Arc<Mutex<PreviewState>>,
+    paused: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+}
+
+/// 出帧调度：时钟走到某帧的时间点，就把它丢进出帧口。
+///
+/// 单独起一条线程、按帧的点叫醒，而不是让 UI 那个 30ms 定时器顺手挑一帧：
+/// 后者挑的是"到现在为止最新的那帧"，误差就是一个 tick 的量级（p50 十几毫秒），
+/// 音画同步根本够不着。
+fn sched_loop(s: Arc<Sched>) {
+    // 要读 IAudioClock 的位置，就得自己初始化一次 COM
+    if s.device.is_some() && wasapi::init_com().is_err() {
+        eprintln!("预览调度线程初始化 COM 失败，画面不会动");
+        return;
+    }
+
+    loop {
+        if s.stop.load(Ordering::Acquire) {
+            wasapi::uninit_com();
+            return;
+        }
+        if s.paused.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+
+        let g = s.live.lock().unwrap();
+        let (Some(ring), Some(map)) = (g.ring.clone(), g.map.clone()) else {
+            drop(g);
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        };
+        let seek = g.seek;
+        let audio = g.audio;
+        // 读哪个时钟得先看这个文件走不走设备：没音轨的会话上设备是停着的，
+        // 拿它的位置来算，位置永远停在原地，画面就再也不动了。
+        let raw_local = match (&s.device, audio) {
+            (Some(d), true) => d.local_us(),
+            _ => s.wall.local_us(),
+        } as f64
+            / 1e6;
+
+        let next_local = map(ring.cursor() + 1) - seek;
+        // 墙钟不能让位置跑到下一帧前头去：解码卡住的时候它会自己往前爬，
+        // 一放开就把内容整段跳过去了。设备时钟不用管，它的位置本来就跟着音频走。
+        let local = if audio {
+            raw_local
+        } else {
+            raw_local.min(next_local)
+        };
+
+        if next_local > local {
+            let d = next_local - local;
+            drop(g);
+            // 一次睡掉大头，最后这一小段自己转。
+            //
+            // 不能"每次只睡 d 的一半、循环着逼近"：本机实测 `sleep` 每次要多花约
+            // 0.5 ms（`sleep(1ms)` 实际 1.53 ms），一帧拆成十来次小睡就把 41.7 ms
+            // 累积成 50 ms 以上，于是每隔几帧整个跳过一帧。跳过的那帧不会体现成
+            // 排期误差（下一帧就在那儿，误差照样很小），只会体现成帧率掉下去。
+            if d > SPIN_SECS {
+                std::thread::sleep(Duration::from_secs_f64(d - SPIN_SECS));
+            } else {
+                std::hint::spin_loop();
+            }
+            continue;
+        }
+
+        let now_abs = seek + local;
+        match ring.take_due(now_abs) {
+            Some(f) => {
+                let secs = f.secs;
+                drop(g);
+                // 发布的是这一帧自己的时间，不是时钟时间。
+                //
+                // 顺序不能反：推送回调一响，UI 线程马上就照着 state 去更新帧号，
+                // 时间先写进去，界面才不会拿到上一帧的读数。
+                s.state.lock().unwrap().time_pos = secs;
+                put_frame(&s.out, f);
+            }
+            None => {
+                let done = ring.is_eof() && ring.back_index().is_none_or(|b| b <= ring.cursor());
+                drop(g);
+                if done {
+                    // 后面没有了，最后那帧留在屏上
+                    std::thread::sleep(Duration::from_millis(20));
+                } else {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------ 控制
+
+/// 控制线程的全部状态。
+struct Ctl {
+    ffmpeg: String,
+    engine: Option<Arc<AudioEngine>>,
+    /// 设备时钟。`engine` 没开出来（或者没有音频设备）时是 `None`。
+    device: Option<Arc<Clock>>,
+    /// 自己数的墙钟。没音轨的文件用它当主时钟。
+    wall: Arc<Clock>,
+    live: Arc<Mutex<Live>>,
+    out: Arc<Mutex<Outbox>>,
+    state: Arc<Mutex<PreviewState>>,
+    paused: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    render: Option<JoinHandle<()>>,
+    sched: Option<JoinHandle<()>>,
+    sess: Option<Session>,
+
+    /// 当前文件
+    path: PathBuf,
+    framing: Framing,
+    map: Option<FrameSecs>,
+    duration: f64,
+    has_audio: bool,
+}
+
+/// 预览线程：开音频设备、起调度和渲染线程、然后跑命令循环。
 fn worker(
-    wid: HWND,
-    extra_options: &'static [(&'static str, &'static str)],
     cmd_rx: Receiver<Command>,
     ready_tx: Sender<Result<(), String>>,
     state: Arc<Mutex<PreviewState>>,
+    out: Arc<Mutex<Outbox>>,
     stop: Arc<AtomicBool>,
 ) {
-    let dll = libmpv_path();
-    let lib = match unsafe { libloading::Library::new(&dll) } {
-        Ok(l) => l,
-        Err(e) => {
-            let _ = ready_tx.send(Err(format!("加载 {} 失败：{e}", dll.display())));
-            return;
-        }
-    };
-
-    let fns = match load_fns(&lib) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = ready_tx.send(Err(e));
-            return;
-        }
-    };
-
-    let handle = unsafe { (fns.create)() };
-    if handle.is_null() {
-        let _ = ready_tx.send(Err("mpv_create 返回了空指针".into()));
+    if !is_available() {
+        let _ = ready_tx.send(Err("找不到 tools/ffmpeg.exe".into()));
         return;
     }
 
-    // 先挂窗口再初始化 —— wid 只在 initialize 之前设才有效。
-    if let Err(e) = configure(&fns, handle, wid, extra_options) {
-        unsafe { (fns.terminate_destroy)(handle) };
-        let _ = ready_tx.send(Err(e));
+    // 默认 15.6 ms 的定时器精度会把渲染线程的等待粒度整个吃掉
+    wasapi::raise_timer_resolution();
+
+    // 设备只在这一条线程上开、整个会话只开一次。跳转只换锚点，不重建设备：
+    // 重建除了慢，还会引入新的音画不同步。
+    //
+    // 就在控制线程上开，不要挪到别处——UI 线程已经被 winit 占成 STA 了，
+    // 那儿 `CoInitializeEx(MTA)` 会直接失败。
+    let engine = match wasapi::init_com().and_then(|_| AudioEngine::open()) {
+        Ok(e) => Some(e),
+        Err(e) => {
+            eprintln!("预览没有声音：{e}");
+            None
+        }
+    };
+
+    // 两个时钟都建好，具体用哪个按当前文件有没有音轨挑（见 `Ctl::clock`）
+    let device = engine.as_ref().map(|e| Arc::new(Clock::Audio(e.clone())));
+    let wall = Arc::new(Clock::wall());
+    let live = Arc::new(Mutex::new(Live {
+        ring: None,
+        map: None,
+        seek: 0.0,
+        audio: false,
+    }));
+    let paused = Arc::new(AtomicBool::new(false));
+
+    let render = engine.as_ref().and_then(|e| {
+        let e = e.clone();
+        spawn_thread("preview-audio", move || {
+            // 每个碰音频接口的线程都自己初始化一次 COM，都按 MTA
+            if let Err(err) = wasapi::init_com() {
+                eprintln!("预览音频线程初始化 COM 失败：{err}");
+                return;
+            }
+            AudioEngine::render_loop(&e);
+            wasapi::uninit_com();
+        })
+    });
+
+    let sched = spawn_thread("preview-sched", {
+        let s = Arc::new(Sched {
+            device: device.clone(),
+            wall: wall.clone(),
+            live: live.clone(),
+            out: out.clone(),
+            state: state.clone(),
+            paused: paused.clone(),
+            stop: stop.clone(),
+        });
+        move || sched_loop(s)
+    });
+    let Some(sched) = sched else {
+        let _ = ready_tx.send(Err("创建预览调度线程失败".into()));
+        // 就走到这儿的话 `ctl.shutdown()` 永远不会跑，没人收音频那边：
+        // 设备一直开着、渲染线程一直转，而且上面那次 `init_com` 也没人配对上。
+        // 按 `shutdown` 里同样的顺序自己收一遍。
+        if let Some(e) = &engine {
+            e.shutdown();
+        }
+        if let Some(h) = render {
+            let _ = h.join();
+        }
+        wasapi::lower_timer_resolution();
+        wasapi::uninit_com();
         return;
-    }
+    };
+
+    let mut ctl = Ctl {
+        ffmpeg: crate::services::ffmpeg_config::ffmpeg_path()
+            .to_string_lossy()
+            .into_owned(),
+        engine,
+        device,
+        wall,
+        live,
+        out,
+        state,
+        paused,
+        stop,
+        render,
+        sched: Some(sched),
+        sess: None,
+        path: PathBuf::new(),
+        framing: Framing::Unknown,
+        map: None,
+        duration: 0.0,
+        has_audio: false,
+    };
 
     let _ = ready_tx.send(Ok(()));
 
-    run_loop(&fns, handle, cmd_rx, state, stop);
-
-    unsafe { (fns.terminate_destroy)(handle) };
-}
-
-/// 解析需要的入口。任何一个缺失都当成 DLL 不可用。
-fn load_fns(lib: &libloading::Library) -> Result<MpvFns, String> {
-    macro_rules! sym {
-        ($name:literal, $ty:ty) => {
-            unsafe {
-                *lib.get::<$ty>(concat!($name, "\0").as_bytes())
-                    .map_err(|e| format!("{} 里找不到 {}：{e}", LIBMPV_FILE, $name))?
-            }
-        };
+    loop {
+        if ctl.stop.load(Ordering::Acquire) {
+            break;
+        }
+        match cmd_rx.recv_timeout(CONTROL_TICK) {
+            Ok(cmd) => match cmd {
+                Command::Seek(t) => ctl.seek_and_drain(&cmd_rx, t),
+                Command::SeekBy(d) => {
+                    let now = ctl.now_secs();
+                    ctl.seek_and_drain(&cmd_rx, now + d)
+                }
+                other => ctl.handle(other),
+            },
+            Err(RecvTimeoutError::Timeout) => {}
+            // 发送端没了，也就是 `Preview` 已经析构。再转下去就是空转，收工。
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
     }
-
-    Ok(MpvFns {
-        create: sym!("mpv_create", unsafe extern "C" fn() -> *mut c_void),
-        initialize: sym!("mpv_initialize", unsafe extern "C" fn(*mut c_void) -> c_int),
-        terminate_destroy: sym!("mpv_terminate_destroy", unsafe extern "C" fn(*mut c_void)),
-        set_option_string: sym!(
-            "mpv_set_option_string",
-            unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int
-        ),
-        command: sym!(
-            "mpv_command",
-            unsafe extern "C" fn(*mut c_void, *const *const c_char) -> c_int
-        ),
-        set_property: sym!(
-            "mpv_set_property",
-            unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int
-        ),
-        get_property: sym!(
-            "mpv_get_property",
-            unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int
-        ),
-        wait_event: sym!(
-            "mpv_wait_event",
-            unsafe extern "C" fn(*mut c_void, f64) -> *mut MpvEvent
-        ),
-        error_string: sym!("mpv_error_string", unsafe extern "C" fn(c_int) -> *const c_char),
-    })
+    ctl.shutdown();
 }
 
-fn err_text(fns: &MpvFns, code: c_int) -> String {
-    let p = unsafe { (fns.error_string)(code) };
-    if p.is_null() {
-        format!("error {code}")
+fn spawn_thread(name: &str, f: impl FnOnce() + Send + 'static) -> Option<JoinHandle<()>> {
+    match std::thread::Builder::new().name(name.into()).spawn(f) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("创建线程 {name} 失败：{e}");
+            None
+        }
+    }
+}
+
+/// 把 `t` 夹进文件范围。时长未知时只保证非负。
+///
+/// 时长未知那一支要单独写：`secs.clamp(0.0, secs)` 在 `secs` 为负时两个端点
+/// 就反了，直接 panic。往回跳正好会算出负的时间（`time_pos + (-5.0)`），
+/// 而"帧率读得到、时长读不到"的文件是有的，这条路上控制线程一死预览就永远卡住。
+fn clamp_seek(duration: f64, secs: f64) -> f64 {
+    if !secs.is_finite() {
+        return 0.0;
+    }
+    if duration > 0.0 {
+        secs.clamp(0.0, duration)
     } else {
-        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+        secs.max(0.0)
     }
 }
 
-/// 设选项 + 初始化。
-fn configure(
-    fns: &MpvFns,
-    handle: *mut c_void,
-    wid: HWND,
-    extra_options: &'static [(&'static str, &'static str)],
-) -> Result<(), String> {
-    let wid_value = CString::new((wid as usize).to_string()).unwrap();
-    let mut options: Vec<(&str, &CStr)> = vec![
-        ("wid", wid_value.as_c_str()),
-        // 播到结尾停在最后一帧，不要自己退出
-        ("keep-open", c"yes"),
-        // 没有文件时也不要退出，方便反复换文件
-        ("idle", c"yes"),
-        // 预览窗口不需要键盘/鼠标交互，也不需要 mpv 自带的控制条
-        ("input-default-bindings", c"no"),
-        ("input-vo-keyboard", c"no"),
-        ("osc", c"no"),
-        ("osd-level", c"0"),
-        // 不要往控制台打日志
-        ("terminal", c"no"),
-        ("msg-level", c"all=no"),
-        ("audio-display", c"no"),
-        // 音量滑块只管 0..100；mpv 默认能到 130（当放大器用），这里收掉
-        ("volume-max", c"100"),
-    ];
-
-    // 测试时补进来的选项（关音频之类）得在 initialize 之前一起设
-    let extra_cstrings: Vec<(CString, CString)> = extra_options
-        .iter()
-        .map(|(k, v)| (CString::new(*k).unwrap(), CString::new(*v).unwrap()))
-        .collect();
-    for (k, v) in &extra_cstrings {
-        options.push((k.to_str().unwrap(), v.as_c_str()));
+impl Ctl {
+    fn use_audio(&self) -> bool {
+        self.has_audio && self.engine.is_some()
     }
 
-    for (name, value) in options {
-        let n = CString::new(name).unwrap();
-        let rc = unsafe { (fns.set_option_string)(handle, n.as_ptr(), value.as_ptr()) };
-        if rc < 0 {
-            return Err(format!("mpv 选项 {name} 设置失败：{}", err_text(fns, rc)));
+    /// 当前文件该走哪个时钟。有音轨就走设备时钟，没有就自己数墙钟。
+    ///
+    /// 用 `engine.is_some()` 挑是不对的：设备开着不代表这个文件有音轨。没音轨的
+    /// 会话里设备是停着的，拿它的位置当主时钟，位置不走，播放就整个停在那儿。
+    fn clock(&self) -> &Clock {
+        match (self.use_audio(), &self.device) {
+            (true, Some(d)) => d,
+            _ => &self.wall,
         }
     }
 
-    let rc = unsafe { (fns.initialize)(handle) };
-    if rc < 0 {
-        return Err(format!("mpv_initialize 失败：{}", err_text(fns, rc)));
+    /// 发布当前显示那一帧的时间。
+    fn publish(&self, secs: f64) {
+        self.state.lock().unwrap().time_pos = secs;
     }
-    Ok(())
-}
 
-/// 跑一条 mpv 命令。用参数数组而不是命令字符串 —— 命令字符串会解析转义，
-/// Windows 路径里的反斜杠会被吃掉。
-fn command(fns: &MpvFns, handle: *mut c_void, args: &[&CStr]) -> c_int {
-    let mut ptrs: Vec<*const c_char> = args.iter().map(|a| a.as_ptr()).collect();
-    ptrs.push(std::ptr::null());
-    unsafe { (fns.command)(handle, ptrs.as_ptr()) }
-}
-
-fn set_flag(fns: &MpvFns, handle: *mut c_void, name: &str, value: bool) -> c_int {
-    let n = CString::new(name).unwrap();
-    let mut v: c_int = i32::from(value);
-    unsafe {
-        (fns.set_property)(
-            handle,
-            n.as_ptr(),
-            MPV_FORMAT_FLAG,
-            &mut v as *mut c_int as *mut c_void,
-        )
+    fn now_secs(&self) -> f64 {
+        self.state.lock().unwrap().time_pos
     }
-}
 
-fn set_double(fns: &MpvFns, handle: *mut c_void, name: &str, value: f64) -> c_int {
-    let n = CString::new(name).unwrap();
-    let mut v = value;
-    unsafe {
-        (fns.set_property)(
-            handle,
-            n.as_ptr(),
-            MPV_FORMAT_DOUBLE,
-            &mut v as *mut f64 as *mut c_void,
-        )
-    }
-}
-
-fn get_flag(fns: &MpvFns, handle: *mut c_void, name: &str) -> Option<bool> {
-    let n = CString::new(name).ok()?;
-    let mut v: c_int = 0;
-    let rc = unsafe {
-        (fns.get_property)(
-            handle,
-            n.as_ptr(),
-            MPV_FORMAT_FLAG,
-            &mut v as *mut c_int as *mut c_void,
-        )
-    };
-    (rc >= 0).then_some(v != 0)
-}
-
-fn get_double(fns: &MpvFns, handle: *mut c_void, name: &str) -> Option<f64> {
-    let n = CString::new(name).ok()?;
-    let mut v: f64 = 0.0;
-    let rc = unsafe {
-        (fns.get_property)(
-            handle,
-            n.as_ptr(),
-            MPV_FORMAT_DOUBLE,
-            &mut v as *mut f64 as *mut c_void,
-        )
-    };
-    (rc >= 0 && v.is_finite()).then_some(v)
-}
-
-/// 主循环：处理命令 → 排空 mpv 事件 → 刷新状态缓存。
-///
-/// 事件必须排空，不然 mpv 内部的事件队列会一直涨，最后把自己的播放线程卡住。
-fn run_loop(
-    fns: &MpvFns,
-    handle: *mut c_void,
-    cmd_rx: Receiver<Command>,
-    state: Arc<Mutex<PreviewState>>,
-    stop: Arc<AtomicBool>,
-) {
-    // 10ms 而不是原来那个 25ms：mpv 自己走完一帧要 25～50ms，轮询粗了会在它后面
-    // 再拖一个周期，界面看着就是「按了没反应」。这个循环一轮只读几个属性，很便宜。
-    const POLL: Duration = Duration::from_millis(10);
-    let mut shutdown = false;
-
-    while !stop.load(Ordering::SeqCst) && !shutdown {
-        loop {
-            match cmd_rx.try_recv() {
-                Ok(cmd) => {
-                    // 逐帧要等 mpv 真的走完才算数（见 wait_for_step）；别的命令
-                    // 发出去就行了，没有"生效没生效"这一说。
-                    let stepping = matches!(cmd, Command::StepFrames(_));
-                    let before = if stepping {
-                        get_double(fns, handle, "time-pos")
-                    } else {
-                        None
-                    };
-                    apply_command(fns, handle, cmd);
-                    if stepping && wait_for_step(fns, handle, before, &state) {
-                        shutdown = true;
-                        break;
-                    }
-                }
-                // 断开说明命令发送端没了，也就是 `Preview` 已经析构、或者压根没建起来
-                // （启动超时那条路 `stop` 永远不会被置位）。再转下去就是空转，收工。
-                Err(TryRecvError::Disconnected) => {
-                    shutdown = true;
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
+    /// 收到跳转时的入口：先把队列里已经排上的跳转一并收掉，只真跳一次。
+    ///
+    /// 一次跳转要停掉旧的、起新的两个解码子进程，实测 150–270 ms 才出第一帧。
+    /// 方向键按住不放会按系统重复率连发（30/s 上下），一条条照做的话队列越积越长，
+    /// 松手之后还得追好几秒。所以真去跳之前先看一眼队列里还排着什么。
+    ///
+    /// 相对跳转是**加起来**、不是只留最后一条：按住方向键本来就是"一直往前挪"，
+    /// 只留最后一条会变成按多久也只挪一次。
+    fn seek_and_drain(&mut self, rx: &Receiver<Command>, target: f64) {
+        let mut target = target;
+        let mut others = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                Command::Seek(t) => target = t,
+                Command::SeekBy(d) => target += d,
+                // 其它命令一条都不能丢，也不能插到跳转前面去。先记下来，
+                // 跳完再按原来的先后顺序执行。
+                other => others.push(other),
             }
         }
-
-        if drain_events(fns, handle) {
-            shutdown = true;
-        }
-
-        refresh_state(fns, handle, &state);
-        std::thread::sleep(POLL);
-    }
-}
-
-/// 非阻塞地把积压的事件收掉。返回 true 表示 mpv 已经关了。
-fn drain_events(fns: &MpvFns, handle: *mut c_void) -> bool {
-    loop {
-        let ev = unsafe { (fns.wait_event)(handle, 0.0) };
-        if ev.is_null() {
-            return false;
-        }
-        let id = unsafe { (*ev).event_id };
-        if id == MPV_EVENT_NONE {
-            return false;
-        }
-        if id == MPV_EVENT_SHUTDOWN {
-            return true;
+        self.handle(Command::Seek(target));
+        for c in others {
+            self.handle(c);
         }
     }
-}
 
-/// 发一批逐帧命令。正数前进、负数后退。
-fn step_frames(fns: &MpvFns, handle: *mut c_void, n: i64) {
-    let verb = CString::new(if n > 0 {
-        "frame-step"
-    } else {
-        "frame-back-step"
-    })
-    .unwrap();
-    for _ in 0..n.unsigned_abs() {
-        command(fns, handle, &[verb.as_c_str()]);
-    }
-}
-
-/// 等 mpv 把刚才那一下逐帧走完，走到哪儿就把快照更新到哪儿。
-///
-/// `frame-step` 是异步的：`mpv_command` 返回的时候画面还没换，`time-pos` 也还是旧值。
-/// 发完命令立刻刷新只会读到旧帧号，得等 mpv 自己走到下一帧。所以在原地边等边刷新，
-/// 快照一更新就是新帧号，界面不用再干等一个轮询周期 —— 手快连点的时候，
-/// 省下的正是「这一次没变、下一次跳 2」里那一下的偏差。
-///
-/// `before` 是发命令之前的位置；拿不到（还没加载完之类）就不等。
-/// 返回 true 表示收到 SHUTDOWN，调用方该收工了。
-fn wait_for_step(
-    fns: &MpvFns,
-    handle: *mut c_void,
-    before: Option<f64>,
-    state: &Arc<Mutex<PreviewState>>,
-) -> bool {
-    // 实测 mpv 走一帧 25～50ms，给到 150ms 是留够余量；撞到首帧/末帧走不动的时候
-    // 也就是在这儿空转一下，不会真的卡住 —— 那种时候本来就没帧可走。
-    const LIMIT: Duration = Duration::from_millis(150);
-    let deadline = Instant::now() + LIMIT;
-    loop {
-        // 等的过程中也得收事件，不然 mpv 的事件队列照样会涨
-        if drain_events(fns, handle) {
-            return true;
+    fn handle(&mut self, cmd: Command) {
+        match cmd {
+            Command::Open(req) => self.open(*req),
+            Command::SetPaused(p) => self.set_paused(p),
+            // 读实时值再取反，不能拿 UI 那份轮询快照
+            Command::TogglePlay => self.set_paused(!self.paused.load(Ordering::Acquire)),
+            Command::Seek(t) => self.seek_abs(t),
+            Command::SeekBy(d) => {
+                let now = self.state.lock().unwrap().time_pos;
+                self.seek_abs(now + d);
+            }
+            Command::StepFrames(n) => self.step(n),
+            Command::SetVolume(v) => self.set_volume(v),
+            Command::StepVolume(d) => {
+                let v = self.state.lock().unwrap().volume + d;
+                self.set_volume(v);
+            }
+            Command::ToggleMute => {
+                let m = self.state.lock().unwrap().mute;
+                self.set_mute(!m);
+            }
         }
-        refresh_state(fns, handle, state);
-        let moved = match (before, get_double(fns, handle, "time-pos")) {
-            (Some(b), Some(now)) => (now - b).abs() > 1e-9,
-            _ => true,
+    }
+
+    fn open(&mut self, req: OpenRequest) {
+        self.path = req.path;
+        self.framing = req.framing;
+        self.duration = req.duration;
+        self.has_audio = req.has_audio;
+        let f = self.framing.clone();
+        self.map = Some(Arc::new(move |i: i64| f.frame_to_secs(i)));
+
+        // 帧率拿不到就没法给帧编号，也就没有时间轴。按错的帧率硬放只会让帧号和
+        // 画面对不上，不如当它加载不了。
+        let usable = self.framing.is_valid();
+        {
+            let mut s = self.state.lock().unwrap();
+            s.loaded = usable;
+            s.duration = req.duration;
+            s.time_pos = 0.0;
+        }
+        if usable {
+            self.start_at(0.0);
+        } else {
+            self.stop_session();
+        }
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
+        self.state.lock().unwrap().paused = paused;
+        if paused {
+            self.clock().pause();
+        } else {
+            // 设备不重建、音频不重灌：缓冲里的东西还在，直接接着走
+            self.clock().resume();
+        }
+    }
+
+    fn set_volume(&mut self, volume: f64) {
+        let volume = volume.clamp(0.0, VOLUME_MAX);
+        let mute = {
+            let mut s = self.state.lock().unwrap();
+            s.volume = volume;
+            s.mute
         };
-        if moved || Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(3));
+        self.push_volume(volume, mute);
     }
-}
 
-fn apply_command(fns: &MpvFns, handle: *mut c_void, cmd: Command) {
-    match cmd {
-        Command::Open(path) => {
-            let verb = CString::new("loadfile").unwrap();
-            // mpv 在 Windows 上接受 UTF-8 路径
-            let Ok(p) = CString::new(path.to_string_lossy().as_bytes()) else {
+    fn set_mute(&mut self, mute: bool) {
+        let volume = {
+            let mut s = self.state.lock().unwrap();
+            s.mute = mute;
+            s.volume
+        };
+        self.push_volume(volume, mute);
+    }
+
+    fn push_volume(&self, volume: f64, mute: bool) {
+        if let Some(e) = &self.engine {
+            e.set_volume(if mute { 0.0 } else { volume as f32 });
+        }
+    }
+
+    fn seek_abs(&mut self, secs: f64) {
+        if self.map.is_none() {
+            return;
+        }
+        self.start_at(secs);
+    }
+
+    /// 跳到 `t` 秒：停掉当前会话，起新的，装环、换 PCM 源、起时钟，等第一帧。
+    fn start_at(&mut self, t: f64) {
+        let Some(map) = self.map.clone() else { return };
+        let t = clamp_seek(self.duration, t);
+        let frame0 = self.framing.first_frame_at_or_after(t);
+
+        // 先摘环：调度线程立刻停手，免得它拿着旧环又吐一帧出去
+        {
+            let mut g = self.live.lock().unwrap();
+            g.ring = None;
+            g.map = Some(map.clone());
+            g.seek = t;
+            g.audio = self.use_audio();
+        }
+        self.out.lock().unwrap().frame = None;
+        // 先按"马上要显示的那一帧"的时间更新一次，界面立刻跟上；第一帧真到了
+        // 还会再写一遍，两者本该一致。
+        self.publish(map(frame0));
+
+        // 设备停流，把残留的旧 PCM 冲掉。Reset 只在停止状态合法，顺序不能反。
+        //
+        // 两个时钟都归零。不只是"顺手"：从有声文件切到没声文件时，设备可能还开着，
+        // 这一下才把它停掉；反过来的话墙钟也只是白重设一次。
+        if let Some(d) = &self.device {
+            d.reset();
+        }
+        self.wall.reset();
+
+        // 旧会话在这里丢掉：子进程杀掉、两条读数线程 join 掉
+        self.stop_session();
+
+        self.start_session(t, frame0);
+    }
+
+    fn audio_spec(&self) -> Option<AudioSpec> {
+        let e = self.engine.as_ref()?;
+        let f = e.format();
+        Some(AudioSpec {
+            rate: f.rate,
+            channels: f.channels,
+            sample: f.ffmpeg_sample().to_string(),
+        })
+    }
+
+    fn start_session(&mut self, t: f64, frame0: i64) {
+        let spec = SourceSpec {
+            ffmpeg: self.ffmpeg.clone(),
+            input: self.path.to_string_lossy().into_owned(),
+            seek: t,
+            frame0,
+            frame_secs: self.map.clone().expect("open 里已经装好"),
+            audio: if self.use_audio() { self.audio_spec() } else { None },
+        };
+        let pcm_limit = spec
+            .audio
+            .as_ref()
+            .map_or(0, |a| a.rate as usize * a.block_align() * PCM_SECS);
+
+        let sess = match Session::start(spec, pcm_limit) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("预览起解码进程失败：{e}");
+                self.state.lock().unwrap().loaded = false;
                 return;
-            };
-            command(fns, handle, &[verb.as_c_str(), p.as_c_str()]);
+            }
+        };
+
+        let ring = sess.frames().clone();
+        // 无条件设一次：没音轨的文件也要把上一次的源清掉。只在两边都有的分支里设的话，
+        // 从有声文件切到没声文件时设备上还挂着旧会话的 PcmFill，那个闭包一直钉着旧环
+        // （PCM_SECS 那一份，几百 KB），而且下次真出声时喂的还是上一个文件的数据。
+        if let Some(engine) = self.engine.clone() {
+            match sess.pcm().cloned() {
+                Some(pcm) => {
+                    let fill: wasapi::PcmFill =
+                        Arc::new(move |dst, need| unsafe { pcm.fill(dst, need) });
+                    engine.set_source(Some(fill));
+                }
+                // 没音轨：清掉上一次的源，设备照走，只是出静音
+                None => engine.set_source(None),
+            }
         }
-        Command::SetPaused(paused) => {
-            set_flag(fns, handle, "pause", paused);
+        self.sess = Some(sess);
+        self.live.lock().unwrap().ring = Some(ring.clone());
+        self.state.lock().unwrap().loaded = true;
+
+        // 先攒够一个设备缓冲再启动。不这么做的话，渲染引擎在等 ffmpeg 出声音的
+        // 那段时间里播的是零、时钟却在走，媒体时间会比第一个真实采样早一百多毫秒。
+        // 暂停状态下只攒不启动，等用户按播放。
+        let playing = !self.paused.load(Ordering::Acquire);
+        if let (Some(e), true) = (&self.engine, self.use_audio()) {
+            if playing {
+                let _ = e.prime_and_start(PRIME_LIMIT);
+            } else {
+                e.prefill();
+            }
         }
-        Command::TogglePlay => {
-            let paused = get_flag(fns, handle, "pause").unwrap_or(true);
-            set_flag(fns, handle, "pause", !paused);
+
+        // 等第一帧。跳转之后环是空的，先摆一帧上去，画面不会停在旧内容上。
+        // 真等不到（比如跳到了末尾）就退回环里最早的那帧，总比留一片空白强。
+        //
+        // 这里分小段轮询而不是一次 `wait_for_index` 等到底：一次等到头的话，
+        // 用户在这 2 秒里关窗口、或者又点了别的文件，控制线程都收不到，
+        // 关窗口会明显卡一下。
+        let first = self.await_frame(&ring, frame0);
+        if let Some(f) = first {
+            ring.set_cursor(f.index);
+            let secs = f.secs;
+            self.publish(secs);
+            put_frame(&self.out, f);
         }
-        Command::Seek(secs) => {
-            let verb = CString::new("seek").unwrap();
-            let value = CString::new(format!("{secs:.3}")).unwrap();
-            // absolute+exact：精确到帧，裁剪打点用得上，代价是慢一点
-            let mode = CString::new("absolute+exact").unwrap();
-            command(fns, handle, &[verb.as_c_str(), value.as_c_str(), mode.as_c_str()]);
-        }
-        Command::SeekBy(secs) => {
-            let verb = CString::new("seek").unwrap();
-            // 带符号的数字加 relative：让 mpv 按实时位置算，别拿我们手上那份
-            // 最多旧十几毫秒的快照去加，长按连发会越走越偏
-            let value = CString::new(format!("{secs:+.3}")).unwrap();
-            let mode = CString::new("relative+exact").unwrap();
-            command(fns, handle, &[verb.as_c_str(), value.as_c_str(), mode.as_c_str()]);
-        }
-        // 只负责把命令发出去。发完之后 mpv 什么时候真的走完那一帧，由
-        // run_loop 里的 wait_for_step 盯着，这里不等。
-        Command::StepFrames(n) => step_frames(fns, handle, n),
-        Command::SetVolume(volume) => {
-            set_double(fns, handle, "volume", volume.clamp(0.0, VOLUME_MAX));
-        }
-        Command::StepVolume(delta) => {
-            let volume = get_double(fns, handle, "volume").unwrap_or(VOLUME_MAX);
-            set_double(fns, handle, "volume", (volume + delta).clamp(0.0, VOLUME_MAX));
-        }
-        Command::ToggleMute => {
-            let mute = get_flag(fns, handle, "mute").unwrap_or(false);
-            set_flag(fns, handle, "mute", !mute);
+
+        // 没音轨时墙钟等第一帧落位再起步，否则开头那段解码时间会白算进去
+        if !self.use_audio() && playing {
+            self.wall.resume();
         }
     }
-}
 
-fn refresh_state(fns: &MpvFns, handle: *mut c_void, state: &Arc<Mutex<PreviewState>>) {
-    // idle-active 为 false 表示有文件在播；duration 拿不到时按 0 处理
-    let loaded = get_flag(fns, handle, "idle-active").map(|idle| !idle).unwrap_or(false);
-    let paused = get_flag(fns, handle, "pause").unwrap_or(true);
-    let time_pos = get_double(fns, handle, "time-pos").unwrap_or(0.0);
-    let duration = get_double(fns, handle, "duration").unwrap_or(0.0);
-    let volume = get_double(fns, handle, "volume").unwrap_or(VOLUME_MAX);
-    let mute = get_flag(fns, handle, "mute").unwrap_or(false);
+    /// 等 `index` 那一帧出现，最多等 [`FIRST_FRAME_LIMIT`]；被叫停就提前退出。
+    ///
+    /// 拿不到就退回环里已有的最后一帧，屏上总得有点东西可看；一个视频帧都没有
+    /// （比如选了个没有视频轨的文件）才返回 `None`。
+    fn await_frame(&self, ring: &FrameRing, index: i64) -> Option<Frame> {
+        let deadline = Instant::now() + FIRST_FRAME_LIMIT;
+        loop {
+            if let Some(f) = ring.get(index) {
+                return Some(f);
+            }
+            // 解码到底了就不用再等：index 要么已经解出来了，要么超出了文件末尾
+            if ring.is_eof() {
+                return match ring.back_index() {
+                    Some(b) if b >= index => ring.get(index),
+                    _ => ring.latest(),
+                };
+            }
+            if self.stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                return ring.latest();
+            }
+            std::thread::sleep(Duration::from_millis(AWAIT_STEP_MS));
+        }
+    }
 
-    let mut s = state.lock().unwrap();
-    let next = PreviewState {
-        loaded,
-        paused,
-        time_pos: if loaded { time_pos } else { 0.0 },
-        duration,
-        volume,
-        mute,
-    };
-    if *s != next {
-        *s = next;
+    /// 停掉当前会话并把环摘掉。可以重复调。
+    fn stop_session(&mut self) {
+        self.live.lock().unwrap().ring = None;
+        drop(self.sess.take());
+    }
+
+    /// 逐帧走缓冲。环里没有那一帧就不动（比如已经走到本次会话的头或是尾）。
+    fn step(&mut self, n: i64) {
+        let g = self.live.lock().unwrap();
+        let Some(ring) = g.ring.clone() else { return };
+        let sign = n.signum();
+        let mut cur = ring.cursor();
+        let mut last = None;
+        for _ in 0..n.abs() {
+            let want = self.framing.clamp_frame(cur + sign);
+            let Some(f) = ring.get(want) else { break };
+            ring.set_cursor(f.index);
+            cur = f.index;
+            last = Some(f);
+        }
+        let Some(f) = last else { return };
+        let secs = f.secs;
+        drop(g);
+        self.publish(secs);
+        put_frame(&self.out, f);
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(h) = self.sched.take() {
+            let _ = h.join();
+        }
+        if let Some(e) = &self.engine {
+            e.shutdown();
+        }
+        if let Some(h) = self.render.take() {
+            let _ = h.join();
+        }
+        // 子进程最后收：读数线程都停了，不会再有人往环里写
+        self.stop_session();
+        wasapi::lower_timer_resolution();
+        wasapi::uninit_com();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, WS_POPUP, WS_VISIBLE,
-    };
 
     #[test]
     fn progress_guards_unknown_duration() {
@@ -697,7 +1077,7 @@ mod tests {
         };
         assert!((s.progress() - 0.5).abs() < 1e-9);
 
-        // 越界要夹住（mpv 报的 time-pos 偶尔会略微超过 duration）
+        // 越界要夹住：帧号反算回来的时间偶尔会略微超过时长
         let s = PreviewState {
             time_pos: 11.0,
             duration: 10.0,
@@ -708,202 +1088,99 @@ mod tests {
 
     #[test]
     fn volume_defaults_to_full_not_zero() {
-        // mpv 起来时音量就是 100，默认值得跟着走，不然滑块会先闪到最左边
+        // 界面在读到真实状态之前会先按默认值画一帧，用 0 的话滑块会先闪到最左边
         let s = PreviewState::default();
         assert_eq!(s.volume, VOLUME_MAX);
         assert!(!s.mute);
+        assert!(!s.loaded);
     }
 
     #[test]
-    fn libmpv_file_name_is_the_real_one() {
-        // dev 包里的名字是 libmpv-2.dll，写成 mpv-2.dll 会一直加载失败
-        assert_eq!(LIBMPV_FILE, "libmpv-2.dll");
-        let p = libmpv_path();
-        assert!(p.ends_with(LIBMPV_FILE), "路径结尾不对: {}", p.display());
+    fn clamp_seek_keeps_negative_input_in_range_when_duration_is_unknown() {
+        // 时长读不到的文件（Duration: N/A）时长是 0。往回跳会算出负的时间，
+        // 这里以前是 `secs.clamp(0.0, secs)`，两端反了，直接 panic 把控制线程打死。
+        assert_eq!(clamp_seek(0.0, -5.0), 0.0);
+        assert_eq!(clamp_seek(0.0, -0.001), 0.0);
+        assert_eq!(clamp_seek(-1.0, -5.0), 0.0);
+        assert_eq!(clamp_seek(0.0, 7.5), 7.5);
     }
 
-    /// 建一个摆在屏幕外的宿主窗口。测试不给人看，但窗口得是"可见"的，
-    /// 否则 mpv 的视频输出可能不肯配置起来。
-    fn offscreen_host() -> HWND {
-        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
-        let title: Vec<u16> = "\0".encode_utf16().collect();
-        unsafe {
-            CreateWindowExW(
-                0,
-                class.as_ptr(),
-                title.as_ptr(),
-                WS_POPUP | WS_VISIBLE,
-                -4000,
-                -4000,
-                320,
-                180,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                GetModuleHandleW(std::ptr::null()),
-                std::ptr::null_mut(),
-            )
-        }
-    }
-
-    /// 用项目自带的 ffmpeg 造一段 10 秒、带音轨的测试片。
-    fn make_clip() -> Option<PathBuf> {
-        let ffmpeg = crate::services::ffmpeg_config::ffmpeg_path();
-        if !ffmpeg.exists() {
-            return None;
-        }
-        let path = crate::testutil::scratch_path("preview_itest_clip.mp4");
-        let _ = std::fs::remove_file(&path);
-        let status = std::process::Command::new(&ffmpeg)
-            .args([
-                "-y", "-v", "error",
-                "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30:duration=10",
-                "-f", "lavfi", "-i", "sine=frequency=440:duration=10",
-                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-shortest",
-            ])
-            .arg(&path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .ok()?;
-        status.success().then_some(path)
-    }
-
-    /// 轮询等状态满足条件；超时返回最后一次的快照。
-    fn wait_until(p: &Preview, timeout: Duration, f: impl Fn(&PreviewState) -> bool) -> PreviewState {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let s = p.state();
-            if f(&s) {
-                return s;
-            }
-            if std::time::Instant::now() >= deadline {
-                return s;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// 走一遍真实的播放控制。需要 tools/libmpv-2.dll，缺了就跳过。
     #[test]
-    fn plays_pauses_seeks_and_steps_frames() {
-        if !is_available() {
-            eprintln!("tools/{LIBMPV_FILE} 不在，跳过预览集成测试");
-            return;
-        }
-        let Some(clip) = make_clip() else {
-            eprintln!("没有可用的 ffmpeg，跳过预览集成测试");
-            return;
-        };
+    fn clamp_seek_fits_into_a_known_duration() {
+        assert_eq!(clamp_seek(10.0, 3.0), 3.0);
+        assert_eq!(clamp_seek(10.0, -3.0), 0.0);
+        assert_eq!(clamp_seek(10.0, 99.0), 10.0);
+    }
 
-        let host = offscreen_host();
-        assert!(!host.is_null(), "建不出宿主窗口");
+    #[test]
+    fn clamp_seek_rejects_non_finite() {
+        assert_eq!(clamp_seek(10.0, f64::NAN), 0.0);
+        assert_eq!(clamp_seek(10.0, f64::INFINITY), 0.0);
+        assert_eq!(clamp_seek(10.0, f64::NEG_INFINITY), 0.0);
+    }
 
-        // 关掉音频：跑测试不该出声
-        let preview = Preview::start(host, &[("audio", "no")]).expect("起预览失败");
+    fn sleep_ms(ms: u64) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
 
-        // 还没加载任何东西
-        assert!(!preview.state().loaded, "刚起来不该是已加载状态");
+    #[test]
+    fn wall_clock_starts_at_zero_only_after_resume() {
+        let c = Clock::wall();
+        // 刚建出来是停着的，位置就是 0
+        assert_eq!(c.local_us(), 0);
 
-        preview.open(&clip);
-        let s = wait_until(&preview, Duration::from_secs(20), |s| s.loaded && s.duration > 0.0);
-        assert!(s.loaded, "文件没加载上");
+        c.reset();
+        assert_eq!(c.local_us(), 0, "reset 之后应该是停着的");
+
+        c.resume();
+        sleep_ms(20);
+        let a = c.local_us();
+        assert!((10_000..200_000).contains(&a), "走了 {a} µs，不像 20 ms");
+    }
+
+    #[test]
+    fn wall_clock_freezes_while_paused_and_keeps_where_it_stopped() {
+        let c = Clock::wall();
+        c.reset();
+        c.resume();
+        sleep_ms(20);
+        c.pause();
+        let frozen = c.local_us();
+        assert!(frozen > 0);
+
+        sleep_ms(30);
+        assert_eq!(c.local_us(), frozen, "暂停期间不该再往前爬");
+
+        c.resume();
+        sleep_ms(20);
+        let after = c.local_us();
         assert!(
-            (s.duration - 10.0).abs() < 0.5,
-            "时长读出来是 {}，应该接近 10",
-            s.duration
+            after > frozen,
+            "恢复之后应该接着走：{frozen} → {after}"
         );
+        // 暂停那 30 ms 不能算进去
+        assert!(after < frozen + 200_000, "停的那段被算进去了：{after}");
+    }
 
-        // 定位
-        preview.set_paused(true);
-        preview.seek(5.0);
-        let s = wait_until(&preview, Duration::from_secs(15), |s| (s.time_pos - 5.0).abs() < 0.2);
-        assert!(
-            (s.time_pos - 5.0).abs() < 0.2,
-            "seek(5.0) 之后位置是 {}",
-            s.time_pos
-        );
-        assert!(s.paused, "seek 之前已经让它暂停了");
+    #[test]
+    fn wall_clock_reset_zeroes_without_resuming() {
+        let c = Clock::wall();
+        c.reset();
+        c.resume();
+        sleep_ms(20);
+        assert!(c.local_us() > 0);
 
-        // 逐帧前进一帧（30fps → 1/30 ≈ 0.0333 秒）
-        let before = preview.state().time_pos;
-        preview.step_frames(1);
-        let s = wait_until(&preview, Duration::from_secs(10), |s| s.time_pos > before + 0.01);
-        let advance = s.time_pos - before;
-        assert!(
-            (0.02..0.06).contains(&advance),
-            "前进一帧走了 {advance:.4}s，30fps 下应该约 0.0333"
-        );
+        c.reset();
+        assert_eq!(c.local_us(), 0);
+        sleep_ms(20);
+        assert_eq!(c.local_us(), 0, "reset 之后没 resume 就不该自己走");
+    }
 
-        // 逐帧后退一帧，应当回到原处
-        preview.step_frames(-1);
-        let s = wait_until(&preview, Duration::from_secs(10), |s| (s.time_pos - before).abs() < 0.02);
-        assert!(
-            (s.time_pos - before).abs() < 0.02,
-            "后退一帧之后是 {}，应该回到 {before}",
-            s.time_pos
-        );
-
-        // 相对跳转：±2 秒。走的是 mpv 的 relative，不是我们拿快照加一加
-        preview.seek_by(2.0);
-        let s = wait_until(&preview, Duration::from_secs(10), |s| s.time_pos > before + 1.5);
-        assert!(
-            (s.time_pos - (before + 2.0)).abs() < 0.25,
-            "seek_by(+2.0) 之后是 {}，应该接近 {}",
-            s.time_pos,
-            before + 2.0
-        );
-        preview.seek_by(-2.0);
-        let s = wait_until(&preview, Duration::from_secs(10), |s| (s.time_pos - before).abs() < 0.25);
-        assert!(
-            (s.time_pos - before).abs() < 0.25,
-            "seek_by(-2.0) 之后是 {}，应该回到 {before}",
-            s.time_pos
-        );
-
-        // 往回跳过头：mpv 会停在 0，不该跑到负数去
-        preview.seek(1.0);
-        let _ = wait_until(&preview, Duration::from_secs(10), |s| (s.time_pos - 1.0).abs() < 0.2);
-        preview.seek_by(-30.0);
-        let s = wait_until(&preview, Duration::from_secs(10), |s| s.time_pos < 0.2);
-        assert!(s.time_pos >= 0.0, "往回跳过头跑到负数了：{}", s.time_pos);
-
-        // 播放/暂停取反：连发两次回到原来的状态
-        let was_paused = preview.state().paused;
-        preview.toggle_paused();
-        let s = wait_until(&preview, Duration::from_secs(10), |s| s.paused != was_paused);
-        assert!(s.paused != was_paused, "toggle_paused 之后 pause 没跟着变");
-        preview.toggle_paused();
-        let s = wait_until(&preview, Duration::from_secs(10), |s| s.paused == was_paused);
-        assert!(s.paused == was_paused, "再 toggle 一次没回到原来的 pause 状态");
-
-        // 音量：属性名或格式写错的话，设下去读回来还是原来的值
-        preview.set_volume(40.0);
-        let s = wait_until(&preview, Duration::from_secs(10), |s| {
-            (s.volume - 40.0).abs() < 0.6
-        });
-        assert!(
-            (s.volume - 40.0).abs() < 0.6,
-            "音量设成 40 之后读回来是 {}",
-            s.volume
-        );
-
-        // 静音取反：从没静音开始，toggle 一次该静音，再一次该恢复
-        assert!(!preview.state().mute, "这时候不该是静音");
-        preview.toggle_mute();
-        let s = wait_until(&preview, Duration::from_secs(10), |s| s.mute);
-        assert!(s.mute, "toggle 之后没静音");
-        preview.toggle_mute();
-        let s = wait_until(&preview, Duration::from_secs(10), |s| !s.mute);
-        assert!(!s.mute, "再 toggle 一次还是静音");
-
-        // 超过上限要被夹住（volume-max 设成了 100）
-        preview.set_volume(1000.0);
-        let s = wait_until(&preview, Duration::from_secs(10), |s| s.volume <= VOLUME_MAX + 0.6);
-        assert!(s.volume <= VOLUME_MAX + 0.6, "音量越过上限了：{}", s.volume);
-
-        drop(preview);
-        unsafe { DestroyWindow(host) };
-        let _ = std::fs::remove_file(&clip);
+    #[test]
+    fn ffmpeg_is_what_makes_preview_available() {
+        // 以前这里看的是 libmpv-2.dll，现在是 ffmpeg.exe
+        let p = crate::services::ffmpeg_config::ffmpeg_path();
+        assert!(p.ends_with("ffmpeg.exe"), "路径不对: {}", p.display());
+        assert_eq!(is_available(), p.exists());
     }
 }

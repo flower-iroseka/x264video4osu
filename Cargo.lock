@@ -5907,18 +5907,18 @@ checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 
 [[package]]
 name = "x264video4osu"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "embed-resource",
  "i-slint-backend-testing",
  "i-slint-compiler",
- "libloading",
  "open",
  "regex",
  "rfd",
  "slint",
  "spin_on",
  "uuid",
+ "windows",
  "windows-sys 0.61.2",
 ]
 

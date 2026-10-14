@@ -1,6 +1,6 @@
 [package]
 name = "x264video4osu"
-version = "3.1.0"
+version = "3.2.0"
 edition = "2021"
 description = "Rust + Slint port of x264video4osu (osu! background video compressor)"
 license = "MIT"
@@ -16,9 +16,20 @@ rfd = "0.17.2"
 regex = "1.11"
 uuid = { version = "1.16", features = ["v4"] }
 open = "5.4.2"
-# 运行时动态加载 tools/libmpv-2.dll（预览用）。不引入编译期链接依赖：
-# 不需要 .lib 和头文件，DLL 缺失时预览功能整体禁用即可。
-libloading = "0.8"
+# 预览用 WASAPI 出声（共享模式 + IAudioClock 当主时钟）。feature 列表和
+# tests-001/wasapi-sync-test/sync-probe 里那份跑通过的保持一致。
+# 和下面的 windows-sys 0.61 并存没问题：两者都只链导入库，不带运行时 DLL。
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Media",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+] }
 # 仅用 GetLocalTime 生成时间戳（旧程序使用 DateTime.Now 格式化）
 # windows-sys 0.61 中 GetLocalTime 位于 Win32_System_SystemInformation，
 # SYSTEMTIME 位于 Win32_Foundation（随该 feature 一并启用）。
@@ -32,6 +43,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Input_KeyboardAndMouse", # EnableWindow：模态期间禁用主窗口
     "Win32_Graphics_Gdi", # MonitorFromWindow / GetMonitorInfoW：取显示器工作区做居中
     "Win32_UI_HiDpi", # AdjustWindowRectExForDpi / GetDpiForWindow：算外框，显示前摆好位置
+    "Win32_System_Threading", # GetCurrentProcess：examples/preview_ffmpeg_spike.rs 量常驻内存
+    "Win32_System_ProcessStatus", # K32GetProcessMemoryInfo：同上
 ] }
 
 [dev-dependencies]

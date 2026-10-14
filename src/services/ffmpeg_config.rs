@@ -21,8 +21,7 @@ pub fn tools_folder() -> PathBuf {
 /// 优先 `<exe>/tools/<name>`，其次相对 cwd 的 `tools/<name>`，
 /// 都不存在时返回前者（由调用者检查）。对应 `GetToolPath`。
 ///
-/// 预览用的 `libmpv-2.dll` 也走这套查找（见 `services::preview`），
-/// 所以这里不限定扩展名、也不限定必须是 exe。
+/// 不限定扩展名、也不限定必须是 exe，方便以后往 tools/ 里放别的东西。
 pub(crate) fn tool_path(name: &str) -> PathBuf {
     let primary = exe_dir().join("tools").join(name);
     if primary.exists() {

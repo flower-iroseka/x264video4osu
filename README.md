@@ -35,10 +35,9 @@ This project is an FFmpeg frontend intended primarily for my own video-encoding 
 
 Place the following files in the `tools` directory, alongside `x264video4osu.exe`:
 
-- `ffmpeg.exe`: Download a GPL build that includes x264 from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/).
-- `libmpv-2.dll` (optional; required only for video preview): Download `mpv-dev-lgpl-x86_64-*.7z` from [zhongfly's mpv Windows builds](https://github.com/zhongfly/mpv-winbuild/releases). The LGPL build keeps it compatible with this project's MIT license.
+- `ffmpeg.exe`: Download a GPL build that includes x264 from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/). It handles both encoding and video preview.
 
-**Note:** Release builds already include both files. These files only need to be prepared manually when building from source.
+**Note:** Release builds already include this file. It only needs to be prepared manually when building from source.
 
 Once the files are in place, run `x264video4osu.exe`. For the workflow, see [Usage](#usage).
 
@@ -168,5 +167,3 @@ Building requires a Rust toolchain with the `x86_64-pc-windows-msvc` target. The
 This project is released under the MIT License.
 
 The included FFmpeg executable (`ffmpeg.exe`) is from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) and is released under the **GPL v3** license.
-
-The included mpv library (`libmpv-2.dll`) is an LGPL build of [mpv](https://mpv.io/) from [zhongfly/mpv-winbuild](https://github.com/zhongfly/mpv-winbuild), and is released under the **LGPL v2.1 or later** (LGPLv2.1+) license.

@@ -511,6 +511,16 @@ pub fn build_audio_extract(input: AudioExtractInput) -> AppResult<EncodePlan> {
 
     // -ss/-to 跟视频编码一样排在 -i 前面：勾了「裁剪视频」时，导出的音频和裁过的
     // 视频是同一段。
+    // 起点不比终点早的话 `-ss` / `-to` 会拼出一条空区间（ffmpeg 那边要么没输出、
+    // 要么直接报错）。调用方已经查过一遍，这里再拦一次，免得以后有人直接调这个函数。
+    if let (Some(s), Some(e)) = (input.trim_start_secs, input.trim_end_secs) {
+        if e <= s {
+            return Err(AppError::InvalidArgument(
+                "Trim end must be after trim start.".into(),
+            ));
+        }
+    }
+
     let mut trim_display = String::new();
     let mut tokens: Vec<String> = vec!["-y".into()];
     if let Some(s) = input.trim_start_secs {

@@ -35,10 +35,9 @@
 
 将以下文件放入与 `x264video4osu.exe` 同级的 `tools` 目录：
 
-- `ffmpeg.exe`：从 [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 下载包含 x264 的 GPL 版本。
-- `libmpv-2.dll`（可选，仅用于视频预览）：从 [zhongfly 的 mpv Windows 构建](https://github.com/zhongfly/mpv-winbuild/releases) 下载 `mpv-dev-lgpl-x86_64-*.7z`。选 LGPL 版，和本项目的 MIT 许可证不冲突。
+- `ffmpeg.exe`：从 [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 下载包含 x264 的 GPL 版本。编码和视频预览都用它。
 
-**注意：** Release 版本已包含上述两个文件。只有从源码自行编译时，才需要手动准备这些文件。
+**注意：** Release 版本已包含该文件。只有从源码自行编译时，才需要手动准备。
 
 文件准备完成后，运行 `x264video4osu.exe`。具体操作参见[使用方法](#使用方法)。
 
@@ -168,5 +167,3 @@ cargo test
 本项目采用 MIT License 发布。
 
 本项目附带的 FFmpeg 程序（`ffmpeg.exe`）来自 [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)，采用 **GPL v3** 许可证发布。
-
-本项目附带的 mpv 库（`libmpv-2.dll`）是 [mpv](https://mpv.io/) 的 LGPL 构建，来自 [zhongfly/mpv-winbuild](https://github.com/zhongfly/mpv-winbuild)，采用 **LGPL v2.1 或更高版本**（LGPLv2.1+）许可证发布。

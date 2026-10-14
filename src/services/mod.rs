@@ -6,6 +6,7 @@ pub mod format;
 pub mod frame_cache;
 pub mod pathutil;
 pub mod preview;
+pub mod preview_media;
 pub mod probe;
 pub mod probe_service;
 pub mod scale;
