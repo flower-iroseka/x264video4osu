@@ -171,15 +171,15 @@ impl FrameTable {
         if tb <= 0.0 {
             return 0;
         }
-        // 秒换算回 timebase 的刻度。末尾那个 1e-6 是防浮点误差：1001/24000 除回去
-        // 有可能是 1000.9999999999999，floor 掉就落到上一帧了。
+        // 秒换算回 timebase 的刻度。末尾那个余量见 floor_eps：mpv 的 time-pos 只到
+        // 毫秒，而且 1001/24000 除回去本身也可能是 1000.9999999999999。
         //
         // 用 floor 而不是 round：要的是"这一刻正在显示的那一帧"，也就是时刻落在哪个
         // 区间里。round 会把某一帧区间最后半个刻度上的时刻算成下一帧（和 CFR 那支的
         // 语义对不上，CFR 用的就是 floor）。
         // saturating_add：秒数大得离谱时 `as i64` 已经饱和到 i64::MAX，
         // 再加首帧的偏移会溢出（debug 直接 panic）。
-        let target = first.saturating_add(((secs / tb) + 1e-6).floor() as i64);
+        let target = first.saturating_add(((secs / tb) + floor_eps(1.0 / tb)).floor() as i64);
         // 要的是"最后一个 pts <= target"，也就是"第一个 > target"再退一格
         self.pts.partition_point(|&p| p <= target).saturating_sub(1) as i64
     }
@@ -191,6 +191,24 @@ impl FrameTable {
 }
 
 // ---- 帧号换算 ----
+
+/// `floor` 之前加的那点余量，单位跟被 floor 的那个数一致：CFR 那支是帧，帧表
+/// 那支是 timebase 刻度。`ticks_per_sec` 就是"一秒有多少个这种单位"，CFR 传帧率，
+/// 帧表传 1/时间基。
+///
+/// 为什么要留余量：mpv 报的 `time-pos` 只精确到毫秒，真实时间被就近舍入过，报出来的
+/// 数最多能比真值小 0.5 毫秒。逐帧停在帧边界上时真值是个整数刻度，舍完就掉到整数
+/// 下面，`floor` 落到上一帧——用户看到的就是"按一下下一帧，帧号不动"。24fps 下
+/// 16000 的时间基上是 8 个刻度，每三帧撞一次。用户手输的时间码同样只写到毫秒。
+///
+/// 取半毫秒不多不少：再小补不回那次舍入，再大就会把边界下方本来属于上一帧的报数
+/// 也推上去。边界两侧 0.5 毫秒内的报数本来就分不清（同一个毫秒值可能来自任意一边），
+/// 这里一律按"算下一帧"处理，宁可多算也不让逐帧掉格子。
+///
+/// 下限 1e-6 是给帧率低得离谱的文件兜底。
+fn floor_eps(ticks_per_sec: f64) -> f64 {
+    (ticks_per_sec * 0.0005).max(1e-6)
+}
 
 /// 帧号和时间戳怎么互相换。
 ///
@@ -248,8 +266,8 @@ impl Framing {
     /// [3.4333, 3.4667)），而不是"离得最近的那一帧"。"把当前预览位置设为起点"
     /// 要的是屏幕上那一帧，四舍五入会让它往后偏一帧。
     ///
-    /// 末尾那个 1e-6 是防浮点误差：`3.4333… × 30` 有可能算出 102.99999999999999，
-    /// 直接 floor 会得到 102。
+    /// 末尾加的余量见 [`floor_eps`]：`3.4333… × 30` 有可能算出 102.99999999999999，
+    /// 而且 mpv 报的时间本身就只精确到毫秒。
     ///
     /// 帧率拿不到、秒数为负或非有限时返回 0。
     pub fn secs_to_frame(&self, secs: f64) -> i64 {
@@ -258,7 +276,8 @@ impl Framing {
                 if !secs.is_finite() || secs < 0.0 {
                     return 0;
                 }
-                ((secs * r.as_f64()) + 1e-6).floor() as i64
+                let fps = r.as_f64();
+                ((secs * fps) + floor_eps(fps)).floor() as i64
             }
             Framing::Vfr { table, .. } => table.secs_to_frame(secs),
             _ => 0,
@@ -1112,9 +1131,11 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'x.mp4':
         // 帧 i 占 [i*1001/24000, (i+1)*1001/24000)。取正在显示的那一帧。
         assert_eq!(t.secs_to_frame(0.0), 0);
         assert_eq!(t.secs_to_frame(1001.0 / 24000.0), 1);
-        assert_eq!(t.secs_to_frame(1000.0 / 24000.0), 0, "差一点点还算第 0 帧");
-        // 第 0 帧占 [0, 1001) 刻度。1000.6 还在这一帧里，四舍五入会算成第 1 帧。
-        assert_eq!(t.secs_to_frame(1000.6 / 24000.0), 0, "区间最后半个刻度仍是这一帧");
+        // 帧边界下方半个毫秒（这个时间基上是 12 个刻度）按下一帧算，见 floor_eps。
+        // 第 0 帧占 [0, 1001) 刻度，989 已经贴到上界了，舍入误差能把它推过去。
+        assert_eq!(t.secs_to_frame(989.0 / 24000.0), 1, "边界下方半毫秒内算下一帧");
+        assert_eq!(t.secs_to_frame(988.0 / 24000.0), 0, "再退一格就还是这一帧");
+        assert_eq!(t.secs_to_frame(900.0 / 24000.0), 0, "明显在区间里，算这一帧");
         assert_eq!(t.secs_to_frame(1e9), 4, "超出末尾落到最后一帧");
         assert_eq!(t.secs_to_frame(-1.0), 0, "负数是无效输入");
         assert_eq!(t.secs_to_frame(f64::NAN), 0);
@@ -1211,6 +1232,24 @@ frame=  100 fps=0.0 time=00:00:03.34 bitrate=N/A speed=1e+03x\rframe=10466 fps=0
         let g = Framing::Cfr(Rational::new(30, 1));
         assert_eq!(g.secs_to_frame(3.4567), 103);
         assert_eq!(g.secs_to_frame(103.0 / 30.0), 103, "帧边界上不能因浮点误差退回上一帧");
+    }
+
+    #[test]
+    fn cfr_secs_to_frame_survives_millisecond_rounding() {
+        // mpv 的 time-pos 只到毫秒。24fps 下一帧 41.667 毫秒，真实帧边界被就近舍入
+        // 之后可能落到边界下方，floor 就会退回上一帧。用户报的"按下一帧帧号不动"。
+        let f = Framing::Cfr(Rational::new(24, 1));
+        // 3161/24 = 131.70833…，mpv 报 131.708
+        assert_eq!(f.secs_to_frame(131.708), 3161);
+        // 3160/24 = 131.66667…，mpv 报 131.667
+        assert_eq!(f.secs_to_frame(131.667), 3160);
+
+        // 连着十帧，每帧都按 mpv 的方式舍到毫秒再换算，一次都不许错。
+        // 24fps 上每隔三帧就会撞到一次边界，修之前正是这三种位置出问题。
+        for n in 3160..3170 {
+            let as_mpv_would_report = ((n as f64) / 24.0 * 1000.0).round() / 1000.0;
+            assert_eq!(f.secs_to_frame(as_mpv_would_report), n, "第 {n} 帧");
+        }
     }
 
     #[test]

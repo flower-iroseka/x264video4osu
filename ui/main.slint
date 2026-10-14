@@ -505,7 +505,7 @@ export component MainWindow inherits Window {
     callback scroll-log-to-end();
 
     // ---------- 预览面板 ----------
-    // 状态由 app.rs 每 100ms 从 mpv 那边读一次后写进来。
+    // 状态由 app.rs 每 30ms 从 mpv 那边读一次后写进来。
     in-out property <bool> preview-loaded: false;
     in-out property <bool> preview-paused: true;
     // 当前位置 / 总时长，两个拼起来显示成「当前时间 / 视频总时间」
@@ -618,8 +618,8 @@ export component MainWindow inherits Window {
                     }
                     accept
                 } else if (event.text == Key.UpArrow) {
-                    // 交给 Rust 侧按 mpv 的实时音量加，别拿界面那份 100ms 前的
-                    // 快照加：连按两下会都按同一个旧值算，只涨一档
+                    // 交给 Rust 侧按 mpv 的实时音量加，别拿界面那份轮询快照加：
+                    // 连按两下会都按同一个旧值算，只涨一档
                     root.preview-volume-step(5);
                     accept
                 } else if (event.text == Key.DownArrow) {

@@ -12,7 +12,7 @@
 //! ## 线程模型
 //!
 //! mpv 的全部交互都跑在**一条工作线程**上，UI 线程不直接碰 mpv：
-//! UI 通过 [`Preview::open`] 等方法把命令丢进通道，每 100ms 从 [`Preview::state`]
+//! UI 通过 [`Preview::open`] 等方法把命令丢进通道，每 30ms 从 [`Preview::state`]
 //! 读一次最新状态（和 `FfmpegService` 那套「后台线程 + UI 轮询」保持一致）。
 //!
 //! 这么做还有个好处：`mpv_handle` 的裸指针从来不需要跨线程传递。
@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::HWND;
 
@@ -75,7 +75,7 @@ struct MpvFns {
 /// 滑块 0..100 才和实际音量一一对应。
 pub const VOLUME_MAX: f64 = 100.0;
 
-/// 预览面板要显示的状态。UI 每 100ms 取一次。
+/// 预览面板要显示的状态。UI 每 30ms 取一次。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PreviewState {
     /// 已经装进一个文件（mpv 不在 idle）
@@ -213,7 +213,7 @@ impl Preview {
 
     /// 播放/暂停取反。
     ///
-    /// 不用 `set_paused(!state().paused)`：`state()` 是 25ms 轮询出来的快照，
+    /// 不用 `set_paused(!state().paused)`：`state()` 是轮询出来的快照，
     /// 长按空格时的自动重复会连着发好几条命令，拿旧快照算就会翻错。
     /// 交给握着 mpv 的那个线程读实时值。
     pub fn toggle_paused(&self) {
@@ -250,7 +250,7 @@ impl Preview {
 
     /// 在当前音量上加减 `delta`。快捷键用。
     ///
-    /// 和 [`Preview::toggle_paused`] 一样交给工作线程算：`state()` 是 25ms 轮询的
+    /// 和 [`Preview::toggle_paused`] 一样交给工作线程算：`state()` 是轮询出来的
     /// 快照，连按 ↑ 时几条命令都拿同一份旧值加 5，结果只涨了一档。
     pub fn step_volume(&self, delta: f64) {
         if delta.is_finite() && delta != 0.0 {
@@ -491,13 +491,29 @@ fn run_loop(
     state: Arc<Mutex<PreviewState>>,
     stop: Arc<AtomicBool>,
 ) {
-    const POLL: Duration = Duration::from_millis(25);
+    // 10ms 而不是原来那个 25ms：mpv 自己走完一帧要 25～50ms，轮询粗了会在它后面
+    // 再拖一个周期，界面看着就是「按了没反应」。这个循环一轮只读几个属性，很便宜。
+    const POLL: Duration = Duration::from_millis(10);
     let mut shutdown = false;
 
     while !stop.load(Ordering::SeqCst) && !shutdown {
         loop {
             match cmd_rx.try_recv() {
-                Ok(cmd) => apply_command(fns, handle, cmd),
+                Ok(cmd) => {
+                    // 逐帧要等 mpv 真的走完才算数（见 wait_for_step）；别的命令
+                    // 发出去就行了，没有"生效没生效"这一说。
+                    let stepping = matches!(cmd, Command::StepFrames(_));
+                    let before = if stepping {
+                        get_double(fns, handle, "time-pos")
+                    } else {
+                        None
+                    };
+                    apply_command(fns, handle, cmd);
+                    if stepping && wait_for_step(fns, handle, before, &state) {
+                        shutdown = true;
+                        break;
+                    }
+                }
                 // 断开说明命令发送端没了，也就是 `Preview` 已经析构、或者压根没建起来
                 // （启动超时那条路 `stop` 永远不会被置位）。再转下去就是空转，收工。
                 Err(TryRecvError::Disconnected) => {
@@ -508,24 +524,78 @@ fn run_loop(
             }
         }
 
-        // 非阻塞地把积压的事件收掉
-        loop {
-            let ev = unsafe { (fns.wait_event)(handle, 0.0) };
-            if ev.is_null() {
-                break;
-            }
-            let id = unsafe { (*ev).event_id };
-            if id == MPV_EVENT_NONE {
-                break;
-            }
-            if id == MPV_EVENT_SHUTDOWN {
-                shutdown = true;
-                break;
-            }
+        if drain_events(fns, handle) {
+            shutdown = true;
         }
 
         refresh_state(fns, handle, &state);
         std::thread::sleep(POLL);
+    }
+}
+
+/// 非阻塞地把积压的事件收掉。返回 true 表示 mpv 已经关了。
+fn drain_events(fns: &MpvFns, handle: *mut c_void) -> bool {
+    loop {
+        let ev = unsafe { (fns.wait_event)(handle, 0.0) };
+        if ev.is_null() {
+            return false;
+        }
+        let id = unsafe { (*ev).event_id };
+        if id == MPV_EVENT_NONE {
+            return false;
+        }
+        if id == MPV_EVENT_SHUTDOWN {
+            return true;
+        }
+    }
+}
+
+/// 发一批逐帧命令。正数前进、负数后退。
+fn step_frames(fns: &MpvFns, handle: *mut c_void, n: i64) {
+    let verb = CString::new(if n > 0 {
+        "frame-step"
+    } else {
+        "frame-back-step"
+    })
+    .unwrap();
+    for _ in 0..n.unsigned_abs() {
+        command(fns, handle, &[verb.as_c_str()]);
+    }
+}
+
+/// 等 mpv 把刚才那一下逐帧走完，走到哪儿就把快照更新到哪儿。
+///
+/// `frame-step` 是异步的：`mpv_command` 返回的时候画面还没换，`time-pos` 也还是旧值。
+/// 发完命令立刻刷新只会读到旧帧号，得等 mpv 自己走到下一帧。所以在原地边等边刷新，
+/// 快照一更新就是新帧号，界面不用再干等一个轮询周期 —— 手快连点的时候，
+/// 省下的正是「这一次没变、下一次跳 2」里那一下的偏差。
+///
+/// `before` 是发命令之前的位置；拿不到（还没加载完之类）就不等。
+/// 返回 true 表示收到 SHUTDOWN，调用方该收工了。
+fn wait_for_step(
+    fns: &MpvFns,
+    handle: *mut c_void,
+    before: Option<f64>,
+    state: &Arc<Mutex<PreviewState>>,
+) -> bool {
+    // 实测 mpv 走一帧 25～50ms，给到 150ms 是留够余量；撞到首帧/末帧走不动的时候
+    // 也就是在这儿空转一下，不会真的卡住 —— 那种时候本来就没帧可走。
+    const LIMIT: Duration = Duration::from_millis(150);
+    let deadline = Instant::now() + LIMIT;
+    loop {
+        // 等的过程中也得收事件，不然 mpv 的事件队列照样会涨
+        if drain_events(fns, handle) {
+            return true;
+        }
+        refresh_state(fns, handle, state);
+        let moved = match (before, get_double(fns, handle, "time-pos")) {
+            (Some(b), Some(now)) => (now - b).abs() > 1e-9,
+            _ => true,
+        };
+        if moved || Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(3));
     }
 }
 
@@ -556,21 +626,14 @@ fn apply_command(fns: &MpvFns, handle: *mut c_void, cmd: Command) {
         Command::SeekBy(secs) => {
             let verb = CString::new("seek").unwrap();
             // 带符号的数字加 relative：让 mpv 按实时位置算，别拿我们手上那份
-            // 最多旧 25ms 的快照去加，长按连发会越走越偏
+            // 最多旧十几毫秒的快照去加，长按连发会越走越偏
             let value = CString::new(format!("{secs:+.3}")).unwrap();
             let mode = CString::new("relative+exact").unwrap();
             command(fns, handle, &[verb.as_c_str(), value.as_c_str(), mode.as_c_str()]);
         }
-        Command::StepFrames(n) => {
-            let verb = if n > 0 {
-                CString::new("frame-step").unwrap()
-            } else {
-                CString::new("frame-back-step").unwrap()
-            };
-            for _ in 0..n.unsigned_abs() {
-                command(fns, handle, &[verb.as_c_str()]);
-            }
-        }
+        // 只负责把命令发出去。发完之后 mpv 什么时候真的走完那一帧，由
+        // run_loop 里的 wait_for_step 盯着，这里不等。
+        Command::StepFrames(n) => step_frames(fns, handle, n),
         Command::SetVolume(volume) => {
             set_double(fns, handle, "volume", volume.clamp(0.0, VOLUME_MAX));
         }

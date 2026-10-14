@@ -55,11 +55,11 @@ pub fn convert_unit_text(text: &str, to_frames: bool, timing: &Framing) -> Strin
         return text.to_string();
     }
     let converted = if to_frames {
-        // 时间戳只写到毫秒，帧号换算成时间再换回来会差那么一点点，
-        // 30fps 下第 1 帧是 33.33ms，存成 00:00:00.033 之后乘回去只有 0.99 帧，
-        // floor 会掉到第 0 帧。补上半个毫秒正好抵消这次取整，来回切换不会掉帧。
-        // （半个毫秒乘以再高的帧率也不到一帧，不会冲到下一帧去。）
-        parse_timecode(text).map(|secs| timing.secs_to_frame(secs + 0.0005).to_string())
+        // 这里不用再补容差：时间戳只写到毫秒，30fps 下第 1 帧是 33.33ms，存成
+        // 00:00:00.033 之后乘回去只剩 0.99 帧，本来会 floor 到第 0 帧。这半毫秒的
+        // 舍入误差现在由 secs_to_frame 自己补（见 probe.rs 的 floor_eps），
+        // 在这里再加一次就会把边界下方本该属于上一帧的值也推上去。
+        parse_timecode(text).map(|secs| timing.secs_to_frame(secs).to_string())
     } else {
         // 负数帧号按帧编码时本来就会被拒，这里也不接受。
         // 越界的帧号先夹进范围再换算。按帧编码时 `resolve_trim` 夹的就是它，时间框

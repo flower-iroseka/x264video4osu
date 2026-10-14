@@ -486,9 +486,12 @@ impl AppController {
         // 不重设窗口物理尺寸（event_loop.rs 的 ScaleFactorChanged 忽略了
         // inner_size_writer），窗口会比渲染画布小，底部按钮栏被裁掉。尺寸不匹配时
         // 重设为 逻辑尺寸 × 缩放因子；只在真的不一致时调用 set_size，开销可以忽略。
+        // 30ms 而不是 100ms：预览面板的帧号/时间由这里搬到界面上，定时器粗了会在
+        // 预览线程之后再多压一段延迟，逐帧连点的时候看着就是数字跟不上。
+        // 一轮里真正干活的是 sync_preview，其余几步都自带「没变就返回」。
         let w = weak.clone();
         let timer = Timer::default();
-        timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
+        timer.start(TimerMode::Repeated, Duration::from_millis(30), move || {
             if let Some(c) = w.upgrade() {
                 let mut c = c.borrow_mut();
                 c.drain_events();
@@ -1043,7 +1046,7 @@ impl AppController {
         });
     }
 
-    /// 展开/收起预览。窗口宽度跟着变，立刻应用一次免得等 100ms 的轮询。
+    /// 展开/收起预览。窗口宽度跟着变，立刻应用一次免得等 30ms 的轮询。
     /// 展开状态不写进设置：下次启动还是收起的。
     fn toggle_preview_expanded(&mut self) {
         let expanded = !self.ui.get_preview_expanded();
@@ -1058,7 +1061,7 @@ impl AppController {
     }
 
     /// 把预览的当前状态搬到界面上，并顺手摆好 mpv 的子窗口。
-    /// 由 100ms 的轮询定时器调用。
+    /// 由 30ms 的轮询定时器调用。
     fn sync_preview(&mut self) {
         if self.preview.is_none() {
             return;
